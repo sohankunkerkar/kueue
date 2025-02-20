@@ -22,7 +22,7 @@ LD_FLAGS += -X '$(version_pkg).GitVersion=$(GIT_TAG)'
 LD_FLAGS += -X '$(version_pkg).GitCommit=$(shell git rev-parse HEAD)'
 
 .PHONY: test-e2e-ocp
-test-e2e-ocp: kustomize ginkgo yq gomod-download dep-crds kueuectl ginkgo-top run-test-e2e-ocp-singlecluster
+test-e2e-ocp: gomod-download dep-crds kueuectl ginkgo-top run-test-e2e-ocp-singlecluster
 run-test-e2e-ocp-singlecluster:
 	@echo "Running e2e tests on OpenShift cluster ($(shell oc whoami --show-server))"
 		ARTIFACTS="$(ARTIFACTS)/$@" IMAGE_TAG=$(IMAGE_TAG) GINKGO_ARGS="$(GINKGO_ARGS)" \
