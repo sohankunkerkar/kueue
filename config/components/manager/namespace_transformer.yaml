@@ -1,0 +1,12 @@
+apiVersion: builtin
+kind: NamespaceTransformer
+metadata:
+  name: namespace-transformer
+namespace: kueue-system
+fieldSpecs:
+- path: metadata/namespace
+  create: true
+- path: subjects/namespace
+  kind: RoleBinding
+- path: subjects/namespace
+  kind: ClusterRoleBinding

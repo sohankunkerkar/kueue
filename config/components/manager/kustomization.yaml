@@ -1,6 +1,9 @@
 resources:
 - manager.yaml
 
+transformers:
+- namespace_transformer.yaml
+
 generatorOptions:
   disableNameSuffixHash: true
 

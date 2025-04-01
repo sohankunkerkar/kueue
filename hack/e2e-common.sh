@@ -166,11 +166,27 @@ function wait_for_cert_manager_ready() {
 # $1 cluster
 function cluster_kueue_deploy {
     kubectl config use-context "kind-${1}"
+    local kustomize_path namespace temp_dir
+    
+    # Determine which kustomize path to use
     if [[ -n ${CERTMANAGER_VERSION:-} ]]; then
-       wait_for_cert_manager_ready
-       kubectl apply --server-side -k test/e2e/config/certmanager
+        wait_for_cert_manager_ready
+        kustomize_path="test/e2e/config/certmanager"
     else
-       kubectl apply --server-side -k test/e2e/config/default  
+        kustomize_path="test/e2e/config/default"
+    fi
+
+    namespace="${KUEUE_NAMESPACE:-}"
+    
+    if [[ -n "$namespace" ]]; then
+        # Create a namespace if it doesn't exist
+        kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Apply resources with namespace override
+        $KUSTOMIZE build "${kustomize_path}" | sed "s/namespace: kueue-system/namespace: ${namespace}/g" | kubectl apply --server-side -f -
+    else
+        # Apply directly without modifications
+        kubectl apply --server-side -k "${kustomize_path}"
     fi
 }
 
