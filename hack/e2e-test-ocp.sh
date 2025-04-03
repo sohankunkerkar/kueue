@@ -142,8 +142,8 @@ function deploy_cert_manager {
 
 trap collect_logs EXIT
 
-deploy_cert_manager
-deploy_kueue
+#deploy_cert_manager
+#deploy_kueue
 
 # Label two worker nodes for e2e tests (similar to the Kind setup).
 label_worker_nodes
@@ -153,7 +153,7 @@ label_worker_nodes
 # supported in OCP. Also, skip Alpha features like TAS.
 # TODO: Remove Fair Sharing from the skip list once the issue is fixed.
 $GINKGO $GINKGO_ARGS \
-  --skip="(AppWrapper|JobSet|LeaderWorkerSet|Pod|Deployment|StatefulSet|Metrics|Fair Sharing|TopologyAwareScheduling)" \
+  --skip="(AppWrapper|JobSet|LeaderWorkerSet|Metrics|Fair Sharing|TopologyAwareScheduling)" \
   --junit-report=junit.xml \
   --json-report=e2e.json \
   --output-dir="$ARTIFACTS" \
