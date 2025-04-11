@@ -166,12 +166,32 @@ function wait_for_cert_manager_ready() {
 # $1 cluster
 function cluster_kueue_deploy {
     kubectl config use-context "kind-${1}"
+    local namespace tmp_dir
+    namespace="${KUEUE_NAMESPACE:-kueue-system}"
+    
+    # Create namespace if it doesn't exist
+    kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Handle cert-manager setup if needed
+    local kustomize_path="test/e2e/config/default"
     if [[ -n ${CERTMANAGER_VERSION:-} ]]; then
-       wait_for_cert_manager_ready
-       kubectl apply --server-side -k test/e2e/config/certmanager
-    else
-       kubectl apply --server-side -k test/e2e/config/default  
+        wait_for_cert_manager_ready
+        KUSTOMIZE_PATH="test/e2e/config/certmanager"
     fi
+
+     tmp_dir=$(mktemp -d)
+     cp -r "${kustomize_path}"/* "${tmp_dir}/"
+     trap 'rm -rf "${tmp_dir}"' EXIT
+    # Process Kustomization with environment substitution
+    (
+       cd "${tmp_dir}" || return 1
+       $KUSTOMIZE edit set namespace "${namespace}"
+        
+       $KUSTOMIZE build . | \
+            sed "s/namespace: kueue-system/namespace: ${namespace}/g" | \
+            sed "s/name: kueue-system/name: ${namespace}/g" | \
+            kubectl apply --server-side -f -
+    )
 }
 
 #$1 - cluster name
@@ -235,3 +255,8 @@ export INITIAL_IMAGE
 function restore_managers_image {
     (cd config/components/manager && $KUSTOMIZE edit set image controller="$INITIAL_IMAGE")
 }
+
+function restore_kueue_namespace {
+     (cd "${KUSTOMIZE_PATH}"  && $KUSTOMIZE edit set namespace "$DEFAULT_NAMESPACE" && \
+        echo "${ORIGINAL_KUSTOMIZATION_YAML_FILE}" > kustomization.yaml)
+ }

@@ -20,6 +20,7 @@ set -o pipefail
 
 SOURCE_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$SOURCE_DIR/.."
+DEFAULT_NAMESPACE="kueue-system"
 
 # shellcheck source=hack/e2e-common.sh
 source "${SOURCE_DIR}/e2e-common.sh"
@@ -34,6 +35,7 @@ function cleanup {
     fi
     #do the image restore here for the case when an error happened during deploy
     restore_managers_image
+    restore_kueue_namespace
 }
 
 function startup {
@@ -77,7 +79,9 @@ function kind_load {
 }
 
 function kueue_deploy {
-    (cd config/components/manager && $KUSTOMIZE edit set image controller="$IMAGE_TAG")
+    local namespace=${KUEUE_NAMESPACE:-kueue-system}
+    (cd config/components/manager && $KUSTOMIZE edit set image controller="$IMAGE_TAG" && \
+        $KUSTOMIZE edit set namespace "$namespace")
     cluster_kueue_deploy "$KIND_CLUSTER_NAME"
 }
 
