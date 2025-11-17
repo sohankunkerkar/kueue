@@ -776,6 +776,54 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 			})
 		})
+
+		ginkgo.It("Should clear RequeueState when deactivating workload", func() {
+			ginkgo.By("Setting the quota reservation to the workload", func() {
+				util.SetQuotaReservation(ctx, k8sClient, wlKey, admission)
+			})
+
+			ginkgo.By("Manually setting RequeueState on the workload", func() {
+				requeueAt := metav1.NewTime(time.Now().Add(5 * time.Minute))
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sClient.Get(ctx, wlKey, &updatedWl)).To(gomega.Succeed())
+					updatedWl.Status.RequeueState = &kueue.RequeueState{
+						Count:     ptr.To(int32(1)),
+						RequeueAt: &requeueAt,
+					}
+					g.Expect(k8sClient.Status().Update(ctx, &updatedWl)).Should(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Verifying RequeueState was set", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sClient.Get(ctx, wlKey, &updatedWl)).To(gomega.Succeed())
+					g.Expect(updatedWl.Status.RequeueState).NotTo(gomega.BeNil())
+					g.Expect(updatedWl.Status.RequeueState.Count).NotTo(gomega.BeNil())
+					g.Expect(*updatedWl.Status.RequeueState.Count).To(gomega.Equal(int32(1)))
+					g.Expect(updatedWl.Status.RequeueState.RequeueAt).NotTo(gomega.BeNil())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Deactivating the workload", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					var wl kueue.Workload
+					g.Expect(k8sClient.Get(ctx, wlKey, &wl)).To(gomega.Succeed())
+					wl.Spec.Active = ptr.To(false)
+					g.Expect(k8sClient.Update(ctx, &wl)).Should(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Checking RequeueState is cleared after deactivation", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sClient.Get(ctx, wlKey, &updatedWl)).To(gomega.Succeed())
+
+					if updatedWl.Status.RequeueState != nil {
+						g.Expect(updatedWl.Status.RequeueState.Count).To(gomega.BeNil())
+						g.Expect(updatedWl.Status.RequeueState.RequeueAt).To(gomega.BeNil())
+					}
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+		})
 	})
 
 	ginkgo.When("Workload uses a provision admission check with BackoffLimitCount=1", func() {

@@ -886,9 +886,12 @@ func PropagateResourceRequests(w *kueue.Workload, info *Info) bool {
 // If strict is true, resourceVersion will be part of the patch.
 func admissionStatusPatch(w *kueue.Workload, wlCopy *kueue.Workload) {
 	wlCopy.Status.Admission = w.Status.Admission.DeepCopy()
-	// Only include RequeueState in the patch if it has meaningful content.
-	if w.Status.RequeueState != nil && (w.Status.RequeueState.Count != nil || w.Status.RequeueState.RequeueAt != nil) {
+	// Always include RequeueState in the patch (even if nil) to ensure SSA can manage it.
+	// This is consistent with how ClusterName, NominatedClusterNames, and UnhealthyNodes are handled.
+	if w.Status.RequeueState != nil {
 		wlCopy.Status.RequeueState = w.Status.RequeueState.DeepCopy()
+	} else {
+		wlCopy.Status.RequeueState = nil
 	}
 	if wlCopy.Status.Admission != nil {
 		// Clear ResourceRequests; Assignment.PodSetAssignment[].ResourceUsage supercedes it
