@@ -17,6 +17,7 @@ limitations under the License.
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"testing"
@@ -779,5 +780,63 @@ func TestDominantResourceShare(t *testing.T) {
 				t.Errorf("dominantResourceShare snapshot mismatch: %s", diff)
 			}
 		})
+	}
+}
+
+func TestCalculateLendableWithLendingLimit(t *testing.T) {
+	// Verify that lending limits disable root cohort caching.
+	// With lending limits, potentialAvailable must be computed per-node.
+	ctx := context.Background()
+	cache := New(utiltesting.NewFakeClient())
+	cache.AddOrUpdateResourceFlavor(utiltesting.NewLogger(t), utiltestingapi.MakeResourceFlavor("default").Obj())
+
+	cq := utiltestingapi.MakeClusterQueue("cq").
+		Cohort("child").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				ResourceQuotaWrapper("cpu").NominalQuota("10").Append().
+				Obj(),
+		).Obj()
+	if err := cache.AddClusterQueue(ctx, cq); err != nil {
+		t.Fatalf("Failed to add CQ: %v", err)
+	}
+
+	childCohort := utiltestingapi.MakeCohort("child").
+		Parent("root").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				ResourceQuotaWrapper("cpu").NominalQuota("10").LendingLimit("2").Append().
+				Obj(),
+		).Obj()
+	cache.AddOrUpdateCohort(childCohort)
+
+	rootCohort := utiltestingapi.MakeCohort("root").
+		ResourceGroup(
+			*utiltestingapi.MakeFlavorQuotas("default").
+				ResourceQuotaWrapper("cpu").NominalQuota("0").Append().
+				Obj(),
+		).Obj()
+	cache.AddOrUpdateCohort(rootCohort)
+
+	snapshot, err := cache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Failed to snapshot: %v", err)
+	}
+
+	cqSnapshot := snapshot.ClusterQueues()["cq"]
+	if cqSnapshot == nil {
+		t.Fatalf("CQ snapshot not found")
+	}
+
+	// Root should not have cached lendable due to lending limits in tree.
+	rootSnapshot := snapshot.Cohorts()["root"]
+	if rootSnapshot.GetCachedLendable() != nil {
+		t.Errorf("Root cohort should not cache lendable when lending limits exist")
+	}
+
+	lendable := calculateLendable(cqSnapshot.Parent())
+	// Expected: 20000m (CQ 10 + Child 10 CPUs)
+	if got := lendable[corev1.ResourceCPU]; got != 20000 {
+		t.Errorf("Lendable CPU = %d, want 20000", got)
 	}
 }

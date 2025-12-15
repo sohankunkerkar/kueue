@@ -17,6 +17,8 @@ limitations under the License.
 package scheduler
 
 import (
+	corev1 "k8s.io/api/core/v1"
+
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/cache/hierarchy"
 	"sigs.k8s.io/kueue/pkg/resources"
@@ -29,6 +31,11 @@ type CohortSnapshot struct {
 	hierarchy.Cohort[*ClusterQueueSnapshot, *CohortSnapshot]
 
 	FairWeight float64
+
+	// cachedLendable stores precomputed lendable resources for the root cohort.
+	// This is computed once during snapshot creation and used to avoid
+	// repeated tree traversals in calculateLendable.
+	cachedLendable map[corev1.ResourceName]int64
 }
 
 func (c *CohortSnapshot) GetName() kueue.CohortReference {
@@ -89,4 +96,49 @@ func (c *CohortSnapshot) fairWeight() float64 {
 
 func (c *CohortSnapshot) BorrowingWith(fr resources.FlavorResource, val int64) bool {
 	return c.ResourceNode.Usage[fr]+val > c.ResourceNode.SubtreeQuota[fr]
+}
+
+// PrecomputeLendable caches lendable resources for root cohorts without borrowing/lending limits.
+func (c *CohortSnapshot) PrecomputeLendable() {
+	if c.HasParent() {
+		// Only root cohorts should cache lendable
+		return
+	}
+	if c.hasBorrowingOrLendingLimitsInSubtree() {
+		return
+	}
+	c.cachedLendable = make(map[corev1.ResourceName]int64, len(c.ResourceNode.SubtreeQuota))
+	for fr, quota := range c.ResourceNode.SubtreeQuota {
+		c.cachedLendable[fr.Resource] += quota
+	}
+}
+
+// hasBorrowingOrLendingLimitsInSubtree checks if any node in the subtree has borrowing or lending limits configured.
+func (c *CohortSnapshot) hasBorrowingOrLendingLimitsInSubtree() bool {
+	// Check this cohort's quotas
+	for _, quota := range c.ResourceNode.Quotas {
+		if quota.BorrowingLimit != nil || quota.LendingLimit != nil {
+			return true
+		}
+	}
+	// Check child cohorts
+	for _, child := range c.ChildCohorts() {
+		if child.hasBorrowingOrLendingLimitsInSubtree() {
+			return true
+		}
+	}
+	// Check child ClusterQueues
+	for _, cq := range c.ChildCQs() {
+		for _, quota := range cq.ResourceNode.Quotas {
+			if quota.BorrowingLimit != nil || quota.LendingLimit != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// GetCachedLendable returns cached lendable resources, or nil if unavailable.
+func (c *CohortSnapshot) GetCachedLendable() map[corev1.ResourceName]int64 {
+	return c.cachedLendable
 }

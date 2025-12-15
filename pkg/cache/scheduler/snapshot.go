@@ -172,6 +172,13 @@ func (c *Cache) Snapshot(ctx context.Context, options ...SnapshotOption) (*Snaps
 			snap.UpdateCohortEdge(cohort.Name, cohort.Parent().Name)
 		}
 	}
+	// Precompute lendable resources for root cohorts to optimize DRS calculations.
+	// This must be done after all cohorts are added to the snapshot.
+	for _, cohortSnapshot := range snap.Cohorts() {
+		if !cohortSnapshot.HasParent() {
+			cohortSnapshot.PrecomputeLendable()
+		}
+	}
 	tasSnapshots := make(map[kueue.ResourceFlavorReference]*TASFlavorSnapshot)
 	if features.Enabled(features.TopologyAwareScheduling) {
 		for flavor, cache := range c.tasCache.Clone() {

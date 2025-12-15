@@ -153,6 +153,12 @@ func calculateLendable(node hierarchicalResourceNode) map[corev1.ResourceName]in
 		root = root.parentHRN()
 	}
 
+	if cohortRoot, ok := root.(*CohortSnapshot); ok {
+		if cached := cohortRoot.GetCachedLendable(); cached != nil {
+			return cached
+		}
+	}
+
 	lendable := make(map[corev1.ResourceName]int64, len(root.getResourceNode().SubtreeQuota))
 	// The root's SubtreeQuota contains all FlavorResources,
 	// as we accumulate even 0s in accumulateFromChild.
