@@ -299,7 +299,7 @@ func StartWorkloadSlicePods(ctx context.Context, clnt client.Client, wl *kueue.W
 	}
 
 	// Fallback to owner reference lookup for backwards compatibility with pods created
-	// before the annotation was introduced.
+	// before the annotation was introduced. This code will be removed in 0.18.
 	if len(list.Items) == 0 && len(wl.OwnerReferences) > 0 {
 		ownerUID := string(wl.OwnerReferences[0].UID)
 		log.V(4).Info("No pods found with annotation, falling back to owner reference lookup", "ownerUID", ownerUID)
