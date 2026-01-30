@@ -239,6 +239,57 @@ var _ = ginkgo.Describe("Scheduler", func() {
 			util.MustCreate(ctx, k8sClient, admissionCheckQueue)
 		})
 
+		ginkgo.It("Should not requeue namespace-mismatched workload on unrelated flavor update", func() {
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.StatefulInadmissibility, true)
+
+			ginkgo.By("creating a ClusterQueue with namespace selector that doesn't match")
+			mismatchCQ := utiltestingapi.MakeClusterQueue("ns-mismatch-cq").
+				NamespaceSelector(&metav1.LabelSelector{
+					MatchLabels: map[string]string{"team": "match"},
+				}).
+				ResourceGroup(*utiltestingapi.MakeFlavorQuotas("on-demand").Resource(corev1.ResourceCPU, "5").Obj()).
+				Obj()
+			createQueue(mismatchCQ)
+
+			ginkgo.By("creating a workload that becomes inadmissible due to namespace mismatch")
+			wl := utiltestingapi.MakeWorkload("ns-mismatch-wl", ns.Name).
+				Queue(kueue.LocalQueueName(mismatchCQ.Name)).
+				Request(corev1.ResourceCPU, "1").
+				Obj()
+			util.MustCreate(ctx, k8sClient, wl)
+			util.ExpectWorkloadsToBePending(ctx, k8sClient, wl)
+
+			ginkgo.By("capturing the initial condition timestamp")
+			var initialTime metav1.Time
+			gomega.Eventually(func(g gomega.Gomega) {
+				updated := &kueue.Workload{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), updated)).To(gomega.Succeed())
+				cond := meta.FindStatusCondition(updated.Status.Conditions, kueue.WorkloadQuotaReserved)
+				g.Expect(cond).NotTo(gomega.BeNil())
+				initialTime = cond.LastTransitionTime
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+
+			ginkgo.By("updating an unrelated flavor")
+			gomega.Eventually(func(g gomega.Gomega) {
+				rf := &kueue.ResourceFlavor{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(onDemandFlavor), rf)).To(gomega.Succeed())
+				if rf.Spec.NodeLabels == nil {
+					rf.Spec.NodeLabels = map[string]string{}
+				}
+				rf.Spec.NodeLabels["updated"] = "true"
+				g.Expect(k8sClient.Update(ctx, rf)).To(gomega.Succeed())
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+
+			ginkgo.By("verifying workload was not requeued (condition timestamp unchanged)")
+			gomega.Consistently(func(g gomega.Gomega) {
+				updated := &kueue.Workload{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), updated)).To(gomega.Succeed())
+				cond := meta.FindStatusCondition(updated.Status.Conditions, kueue.WorkloadQuotaReserved)
+				g.Expect(cond).NotTo(gomega.BeNil())
+				g.Expect(cond.LastTransitionTime).To(gomega.Equal(initialTime))
+			}, "3s", "200ms").Should(gomega.Succeed())
+		})
+
 		ginkgo.JustAfterEach(func() {
 			gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
 			util.ExpectObjectToBeDeleted(ctx, k8sClient, prodClusterQ, true)

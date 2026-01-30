@@ -103,6 +103,16 @@ The label 'result' can have the following values:
 		}, []string{"cluster_queue", "replica_role"},
 	)
 
+	// +metricsdoc:group=clusterqueue
+	// +metricsdoc:labels=cluster_queue="the name of the ClusterQueue"
+	InadmissibleStatusUpdatesSkipped = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: constants.KueueName,
+			Name:      "inadmissible_status_updates_skipped_total",
+			Help:      "The number of status updates skipped due to throttling for inadmissible workloads (KEP-8095)",
+		}, []string{"cluster_queue"},
+	)
+
 	// Metrics tied to the queue system.
 
 	// +metricsdoc:group=clusterqueue
@@ -919,6 +929,7 @@ func Register() {
 		AdmissionAttemptsTotal,
 		admissionAttemptDuration,
 		AdmissionCyclePreemptionSkips,
+		InadmissibleStatusUpdatesSkipped,
 		PendingWorkloads,
 		ReservingActiveWorkloads,
 		AdmittedActiveWorkloads,

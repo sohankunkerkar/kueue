@@ -575,7 +575,7 @@ func (r *WorkloadReconciler) deleteWorkloadFromCaches(ctx context.Context, names
 	// Delete from cache unconditionally. Pending workloads may have been "assumed"
 	// by the scheduler, and leaving them blocks ClusterQueue finalizer removal.
 	// The operation is idempotent if the workload was never in the cache.
-	r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlRef, func() {
+	r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlRef, wlInQueuesCache, func() {
 		if err := r.cache.DeleteWorkload(log, wlRef); err != nil {
 			log.Error(err, "Failed to delete workload from cache")
 		}
@@ -920,7 +920,7 @@ func (r *WorkloadReconciler) Update(e event.TypedUpdateEvent[*kueue.Workload]) b
 		r.queues.AddFinishedWorkload(wlCopy)
 
 		// trigger the move of associated inadmissibleWorkloads, if there are any.
-		r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, func() {
+		r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, wlCopy, func() {
 			// Delete the workload from cache while holding the queues lock
 			// to guarantee that requeued workloads are taken into account before
 			// the next scheduling cycle.
@@ -955,7 +955,7 @@ func (r *WorkloadReconciler) Update(e event.TypedUpdateEvent[*kueue.Workload]) b
 		immediate := backoff <= 0
 		log.V(3).Info("Workload transitioned back to pending", "backoff", backoff, "immediate", immediate)
 		// trigger the move of associated inadmissibleWorkloads, if there are any.
-		r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, func() {
+		r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, wlCopy, func() {
 			// Delete the workload from cache while holding the queues lock
 			// to guarantee that requeued workloads are taken into account before
 			// the next scheduling cycle.
@@ -983,7 +983,7 @@ func (r *WorkloadReconciler) Update(e event.TypedUpdateEvent[*kueue.Workload]) b
 		features.Enabled(features.ElasticJobsViaWorkloadSlices) && workloadslicing.ScaledDown(workload.ExtractPodSetCountsFromWorkload(e.ObjectOld), workload.ExtractPodSetCountsFromWorkload(e.ObjectNew)),
 		workload.PriorityChanged(e.ObjectOld, e.ObjectNew):
 		// trigger the move of associated inadmissibleWorkloads, if there are any.
-		r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, func() {
+		r.queues.QueueAssociatedInadmissibleWorkloadsAfter(ctx, wlKey, wlCopy, func() {
 			// Update the workload from cache while holding the queues lock
 			// to guarantee that requeued workloads are taken into account before
 			// the next scheduling cycle.

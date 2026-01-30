@@ -17,12 +17,23 @@ limitations under the License.
 package queue
 
 import (
-	"maps"
 	"testing"
 
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
+
+func entryFor(info *workload.Info) *inadmissibleEntry {
+	return &inadmissibleEntry{info: info, category: InadmissibleUnknown}
+}
+
+func mapToInadmissible(initial map[workload.Reference]*workload.Info) inadmissibleWorkloads {
+	iw := make(inadmissibleWorkloads)
+	for key, info := range initial {
+		iw.insert(key, entryFor(info))
+	}
+	return iw
+}
 
 func TestInadmissibleWorkloads_Get(t *testing.T) {
 	wl1 := workload.NewInfo(utiltestingapi.MakeWorkload("wl1", "ns1").Obj())
@@ -62,12 +73,14 @@ func TestInadmissibleWorkloads_Get(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
-
+			iw := mapToInadmissible(tc.initial)
 			got := iw.get(tc.key)
-			if got != tc.wantWorkload {
-				t.Errorf("get() = %v, want %v", got, tc.wantWorkload)
+			var gotInfo *workload.Info
+			if got != nil {
+				gotInfo = got.info
+			}
+			if gotInfo != tc.wantWorkload {
+				t.Errorf("get() = %v, want %v", gotInfo, tc.wantWorkload)
 			}
 		})
 	}
@@ -115,15 +128,13 @@ func TestInadmissibleWorkloads_Insert(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
-
-			iw.insert(tc.key, tc.value)
+			iw := mapToInadmissible(tc.initial)
+			iw.insert(tc.key, entryFor(tc.value))
 
 			if got := iw.len(); got != tc.wantLen {
 				t.Errorf("after insert, len() = %d, want %d", got, tc.wantLen)
 			}
-			if got := iw.get(tc.key); got != tc.value {
+			if got := iw.get(tc.key); got == nil || got.info != tc.value {
 				t.Errorf("after insert, get() = %v, want %v", got, tc.value)
 			}
 		})
@@ -177,8 +188,7 @@ func TestInadmissibleWorkloads_Delete(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
+			iw := mapToInadmissible(tc.initial)
 
 			iw.delete(tc.key)
 
@@ -227,8 +237,7 @@ func TestInadmissibleWorkloads_Len(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
+			iw := mapToInadmissible(tc.initial)
 
 			if got := iw.len(); got != tc.wantLen {
 				t.Errorf("len() = %d, want %d", got, tc.wantLen)
@@ -262,8 +271,7 @@ func TestInadmissibleWorkloads_Empty(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
+			iw := mapToInadmissible(tc.initial)
 
 			if got := iw.empty(); got != tc.wantEmpty {
 				t.Errorf("empty() = %v, want %v", got, tc.wantEmpty)
@@ -316,12 +324,11 @@ func TestInadmissibleWorkloads_ForEach(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
+			iw := mapToInadmissible(tc.initial)
 
 			visited := 0
 			seen := make(map[workload.Reference]bool)
-			iw.forEach(func(key workload.Reference, wInfo *workload.Info) bool {
+			iw.forEach(func(key workload.Reference, _ *inadmissibleEntry) bool {
 				visited++
 				seen[key] = true
 				return visited < tc.stopAfter
@@ -397,10 +404,13 @@ func TestInadmissibleWorkloads_ReplaceAll(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			iw := make(inadmissibleWorkloads)
-			maps.Copy(iw, tc.initial)
+			iw := mapToInadmissible(tc.initial)
 
-			iw.replaceAll(tc.newMap)
+			newMap := make(map[workload.Reference]*inadmissibleEntry)
+			for key, info := range tc.newMap {
+				newMap[key] = entryFor(info)
+			}
+			iw.replaceAll(newMap)
 
 			if got := iw.len(); got != tc.wantLen {
 				t.Errorf("after replaceAll, len() = %d, want %d", got, tc.wantLen)

@@ -29,8 +29,11 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -85,7 +88,27 @@ type Scheduler struct {
 	// schedulingCycle identifies the number of scheduling
 	// attempts since the last restart.
 	schedulingCycle int64
+
+	// Throttling for inadmissible workloads (KEP-8095)
+	lastStatusUpdate    map[string]statusUpdateInfo
+	lastEventTime       map[string]time.Time
+	lastThrottleCleanup time.Time
 }
+
+type statusUpdateInfo struct {
+	time    time.Time
+	reason  string
+	message string
+}
+
+const (
+	statusUpdateThrottleDuration = 5 * time.Second
+	eventThrottleDuration        = 5 * time.Second
+	throttleCleanupInterval      = 1 * time.Minute
+	throttleEntryTTL             = 10 * time.Minute
+	inadmissibleSafetyInterval   = 1 * time.Minute
+	inadmissibleSafetyMaxAge     = 60 * time.Second
+)
 
 type options struct {
 	podsReadyRequeuingTimestamp config.RequeuingTimestamp
@@ -158,6 +181,8 @@ func New(queues *qcache.Manager, cache *schdcache.Cache, cl client.Client, recor
 		clock:                   options.clock,
 		admissionFairSharing:    options.admissionFairSharing,
 		roleTracker:             options.roleTracker,
+		lastStatusUpdate:        make(map[string]statusUpdateInfo),
+		lastEventTime:           make(map[string]time.Time),
 	}
 	return s
 }
@@ -167,6 +192,32 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	log := roletracker.WithReplicaRole(ctrl.LoggerFrom(ctx).WithName("scheduler"), s.roleTracker)
 	ctx = ctrl.LoggerInto(ctx, log)
 	go wait.UntilWithBackoff(ctx, s.schedule)
+	go func() {
+		ticker := time.NewTicker(inadmissibleSafetyInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if features.Enabled(features.StatefulInadmissibility) {
+					s.queues.QueueInadmissibleExpired(ctx, inadmissibleSafetyMaxAge)
+				}
+			}
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(throttleCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.cleanupThrottleState(s.clock.Now())
+			}
+		}
+	}()
 	return nil
 }
 
@@ -412,6 +463,7 @@ type entry struct {
 	assignment           flavorassigner.Assignment
 	status               entryStatus
 	inadmissibleMsg      string
+	inadmissibleCategory qcache.InadmissibleCategory
 	requeueReason        qcache.RequeueReason
 	preemptionTargets    []*preemption.Target
 	clusterQueueSnapshot *schdcache.ClusterQueueSnapshot
@@ -438,19 +490,25 @@ func (s *Scheduler) nominate(ctx context.Context, workloads []workload.Info, sna
 			continue
 		} else if workload.HasRetryChecks(w.Obj) || workload.HasRejectedChecks(w.Obj) {
 			e.inadmissibleMsg = "The workload has failed admission checks"
+			e.inadmissibleCategory = qcache.InadmissibleAdmissionCheck
 		} else if snap.InactiveClusterQueueSets.Has(w.ClusterQueue) {
 			e.inadmissibleMsg = fmt.Sprintf("ClusterQueue %s is inactive", w.ClusterQueue)
+			e.inadmissibleCategory = qcache.InadmissibleClusterQueueInactive
 		} else if e.clusterQueueSnapshot == nil {
 			e.inadmissibleMsg = fmt.Sprintf("ClusterQueue %s not found", w.ClusterQueue)
+			e.inadmissibleCategory = qcache.InadmissibleClusterQueueNotFound
 		} else if err := s.client.Get(ctx, types.NamespacedName{Name: w.Obj.Namespace}, &ns); err != nil {
 			e.inadmissibleMsg = fmt.Sprintf("Could not obtain workload namespace: %v", err)
 		} else if !e.clusterQueueSnapshot.NamespaceSelector.Matches(labels.Set(ns.Labels)) {
 			e.inadmissibleMsg = "Workload namespace doesn't match ClusterQueue selector"
 			e.requeueReason = qcache.RequeueReasonNamespaceMismatch
+			e.inadmissibleCategory = qcache.InadmissibleNamespaceMismatch
 		} else if err := workload.ValidateResources(&w); err != nil {
 			e.inadmissibleMsg = fmt.Sprintf("%s: %v", errInvalidWLResources, err.ToAggregate())
+			e.inadmissibleCategory = qcache.InadmissibleInvalidResources
 		} else if err := workload.ValidateLimitRange(ctx, s.client, &w); err != nil {
 			e.inadmissibleMsg = fmt.Sprintf("%s: %v", errLimitRangeConstraintsUnsatisfiedResources, err.ToAggregate())
+			e.inadmissibleCategory = qcache.InadmissibleLimitRangeViolation
 		} else {
 			e.assignment, e.preemptionTargets = s.getAssignments(log, &e.Info, snap)
 			e.inadmissibleMsg = e.assignment.Message()
@@ -696,6 +754,10 @@ func (s *Scheduler) assumeWorkload(log logr.Logger, e *entry, cq *schdcache.Clus
 	e.status = assumed
 	log.V(2).Info("Workload assumed in the cache")
 
+	key := string(workload.Key(e.Obj))
+	delete(s.lastStatusUpdate, key)
+	delete(s.lastEventTime, key)
+
 	if afs.Enabled(s.admissionFairSharing) {
 		s.updateEntryPenalty(log, e, add)
 		// Trigger LocalQueue reconciler to apply any pending penalties
@@ -808,21 +870,155 @@ func (s *Scheduler) requeueAndUpdate(ctx context.Context, e entry) {
 		return
 	}
 
-	added := s.queues.RequeueWorkload(ctx, &e.Info, e.requeueReason)
+	category, details := inadmissibleCategoryForEntry(e)
+	if !features.Enabled(features.StatefulInadmissibility) {
+		category = qcache.InadmissibleUnknown
+		details = qcache.InadmissibleDetails{}
+	}
+	added := s.queues.RequeueWorkload(ctx, &e.Info, e.requeueReason, category, details)
 	log.V(2).Info("Workload re-queued", "workload", klog.KObj(e.Obj), "clusterQueue", klog.KRef("", string(e.ClusterQueue)), "queue", klog.KRef(e.Obj.Namespace, string(e.Obj.Spec.QueueName)), "requeueReason", e.requeueReason, "added", added, "status", e.status)
 	if e.status == notNominated || e.status == skipped {
-		wl := e.Obj.DeepCopy()
-		if err := workload.PatchAdmissionStatus(ctx, s.client, wl, s.clock, func(wl *kueue.Workload) (bool, error) {
-			updated := workload.UnsetQuotaReservationWithCondition(wl, "Pending", e.inadmissibleMsg, s.clock.Now())
-			if workload.PropagateResourceRequests(wl, &e.Info) {
-				updated = true
+		key := string(workload.Key(e.Obj))
+		now := s.clock.Now()
+
+		// Throttle status updates (KEP-8095 Phase 1)
+		shouldUpdateStatus := true
+		existingCond := apimeta.FindStatusCondition(e.Obj.Status.Conditions, kueue.WorkloadQuotaReserved)
+		if existingCond != nil &&
+			existingCond.Status == metav1.ConditionFalse &&
+			existingCond.Reason == "Pending" &&
+			existingCond.ObservedGeneration == e.Obj.Generation &&
+			e.Obj.Status.Admission == nil {
+			if existingCond.Message == e.inadmissibleMsg {
+				shouldUpdateStatus = false
+			} else if lastInfo, ok := s.lastStatusUpdate[key]; ok {
+				withinWindow := now.Sub(lastInfo.time) < statusUpdateThrottleDuration
+				sameReason := lastInfo.reason == "Pending"
+				if withinWindow && sameReason {
+					shouldUpdateStatus = false
+				}
 			}
-			return updated, nil
-		}, workload.WithLooseOnApply(), workload.WithRetryOnConflictForPatch()); err != nil {
-			log.Error(err, "Could not update Workload status")
 		}
-		s.recorder.Eventf(e.Obj, corev1.EventTypeWarning, "Pending", api.TruncateEventMessage(e.inadmissibleMsg))
+		if !shouldUpdateStatus {
+			metrics.InadmissibleStatusUpdatesSkipped.WithLabelValues(string(e.ClusterQueue)).Inc()
+		}
+
+		resourceUpdateNeeded := workload.PropagateResourceRequests(e.Obj.DeepCopy(), &e.Info)
+		if shouldUpdateStatus || resourceUpdateNeeded {
+			wl := e.Obj.DeepCopy()
+			if err := workload.PatchAdmissionStatus(ctx, s.client, wl, s.clock, func(wl *kueue.Workload) (bool, error) {
+				updated := false
+				if shouldUpdateStatus {
+					updated = workload.UnsetQuotaReservationWithCondition(wl, "Pending", e.inadmissibleMsg, s.clock.Now())
+				}
+				if workload.PropagateResourceRequests(wl, &e.Info) {
+					updated = true
+				}
+				return updated, nil
+			}, workload.WithLooseOnApply(), workload.WithRetryOnConflictForPatch()); err != nil {
+				log.Error(err, "Could not update Workload status")
+			} else if shouldUpdateStatus {
+				s.lastStatusUpdate[key] = statusUpdateInfo{time: now, reason: "Pending", message: e.inadmissibleMsg}
+			}
+		}
+
+		// Throttle events (KEP-8095 Phase 1)
+		shouldRecordEvent := true
+		if lastEvent, ok := s.lastEventTime[key]; ok {
+			if now.Sub(lastEvent) < eventThrottleDuration {
+				shouldRecordEvent = false
+			}
+		}
+
+		if shouldRecordEvent {
+			s.recorder.Eventf(e.Obj, corev1.EventTypeWarning, "Pending", api.TruncateEventMessage(e.inadmissibleMsg))
+			s.lastEventTime[key] = now
+		}
 	}
+}
+
+func (s *Scheduler) cleanupThrottleState(now time.Time) {
+	if !s.lastThrottleCleanup.IsZero() && now.Sub(s.lastThrottleCleanup) < throttleCleanupInterval {
+		return
+	}
+	s.lastThrottleCleanup = now
+
+	for key, info := range s.lastStatusUpdate {
+		if now.Sub(info.time) >= throttleEntryTTL {
+			delete(s.lastStatusUpdate, key)
+		}
+	}
+	for key, ts := range s.lastEventTime {
+		if now.Sub(ts) >= throttleEntryTTL {
+			delete(s.lastEventTime, key)
+		}
+	}
+}
+
+func inadmissibleCategoryForEntry(e entry) (qcache.InadmissibleCategory, qcache.InadmissibleDetails) {
+	details := qcache.InadmissibleDetails{}
+	switch e.requeueReason {
+	case qcache.RequeueReasonNamespaceMismatch:
+		return qcache.InadmissibleNamespaceMismatch, details
+	case qcache.RequeueReasonPendingPreemption, qcache.RequeueReasonPreemptionFailed:
+		return qcache.InadmissiblePreemptionPending, details
+	}
+
+	if e.inadmissibleCategory != "" {
+		return e.inadmissibleCategory, details
+	}
+
+	if workload.HasRetryChecks(e.Obj) || workload.HasRejectedChecks(e.Obj) {
+		details.AdmissionChecks = admissionChecksFromWorkload(e.Obj)
+		return qcache.InadmissibleAdmissionCheck, details
+	}
+
+	if reasons := e.assignment.FailureReasons(); len(reasons) > 0 {
+		for _, reason := range reasons {
+			if category, mapped := mapFailureCategory(reason.Category); mapped {
+				return category, detailsFromFailureReason(reason)
+			}
+		}
+	}
+
+	return qcache.InadmissibleUnknown, details
+}
+
+func mapFailureCategory(category flavorassigner.FailureReasonCategory) (qcache.InadmissibleCategory, bool) {
+	switch category {
+	case flavorassigner.FailureQuotaInsufficient:
+		return qcache.InadmissibleQuotaInsufficient, true
+	case flavorassigner.FailureFlavorUnavailable:
+		return qcache.InadmissibleFlavorUnavailable, true
+	case flavorassigner.FailureFlavorUnsuitable:
+		return qcache.InadmissibleFlavorUnsuitable, true
+	case flavorassigner.FailureTASConstraints:
+		return qcache.InadmissibleTASConstraints, true
+	default:
+		return qcache.InadmissibleUnknown, false
+	}
+}
+
+func detailsFromFailureReason(reason flavorassigner.FailureReason) qcache.InadmissibleDetails {
+	return qcache.InadmissibleDetails{
+		Resources:    reason.Resources,
+		Flavors:      reason.Flavors,
+		TopologyName: reason.TopologyName,
+	}
+}
+
+func admissionChecksFromWorkload(wl *kueue.Workload) sets.Set[kueue.AdmissionCheckReference] {
+	checks := sets.New[kueue.AdmissionCheckReference]()
+	if wl == nil {
+		return checks
+	}
+	for i := range wl.Status.AdmissionChecks {
+		ac := wl.Status.AdmissionChecks[i]
+		if ac.State != kueue.CheckStateReady {
+			checks.Insert(ac.Name)
+		}
+	}
+	return checks
 }
 
 // recordWorkloadAdmissionMetrics records metrics and events for workload admission process

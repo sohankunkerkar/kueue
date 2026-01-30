@@ -162,6 +162,17 @@ func (a *Assignment) Message() string {
 	return builder.String()
 }
 
+func (a *Assignment) FailureReasons() []FailureReason {
+	var reasons []FailureReason
+	for _, ps := range a.PodSets {
+		reasons = append(reasons, ps.Status.FailureReasons()...)
+	}
+	if len(reasons) == 0 {
+		return nil
+	}
+	return reasons
+}
+
 func (a *Assignment) ToAPI() []kueue.PodSetAssignment {
 	psFlavors := make([]kueue.PodSetAssignment, len(a.PodSets))
 	for i := range psFlavors {
@@ -197,8 +208,28 @@ func (a *Assignment) TotalRequestsFor(wl *workload.Info) resources.FlavorResourc
 }
 
 type Status struct {
-	reasons []string
-	err     error
+	reasons  []string
+	err      error
+	failures []FailureReason
+}
+
+// FailureReasonCategory classifies why flavor assignment failed.
+type FailureReasonCategory string
+
+const (
+	FailureUnknown           FailureReasonCategory = "Unknown"
+	FailureFlavorUnavailable FailureReasonCategory = "FlavorUnavailable"
+	FailureFlavorUnsuitable  FailureReasonCategory = "FlavorUnsuitable"
+	FailureQuotaInsufficient FailureReasonCategory = "QuotaInsufficient"
+	FailureTASConstraints    FailureReasonCategory = "TASConstraints"
+)
+
+// FailureReason captures why flavor assignment failed for a workload.
+type FailureReason struct {
+	Category     FailureReasonCategory
+	Resources    sets.Set[corev1.ResourceName]
+	Flavors      sets.Set[kueue.ResourceFlavorReference]
+	TopologyName *kueue.TopologyReference
 }
 
 func NewStatus(reasons ...string) *Status {
@@ -220,6 +251,14 @@ func (s *Status) appendf(format string, args ...any) *Status {
 	return s
 }
 
+func (s *Status) addReason(reason FailureReason, format string, args ...any) *Status {
+	if reason.Category == "" {
+		reason.Category = FailureUnknown
+	}
+	s.failures = append(s.failures, reason)
+	return s.appendf(format, args...)
+}
+
 func (s *Status) Message() string {
 	if s == nil {
 		return ""
@@ -229,6 +268,15 @@ func (s *Status) Message() string {
 	}
 	sort.Strings(s.reasons)
 	return strings.Join(s.reasons, ", ")
+}
+
+func (s *Status) FailureReasons() []FailureReason {
+	if s == nil || len(s.failures) == 0 {
+		return nil
+	}
+	reasons := make([]FailureReason, len(s.failures))
+	copy(reasons, s.failures)
+	return reasons
 }
 
 // PodSetAssignment holds the assigned flavors and status messages for each of
@@ -861,7 +909,10 @@ func (a *FlavorAssigner) checkFlavorForPodSets(
 	flavor, exist := a.resourceFlavors[flavorName]
 	if !exist {
 		log.Error(nil, "Flavor not found", "Flavor", flavorName)
-		status.appendf("flavor %s not found", flavorName)
+		status.addReason(FailureReason{
+			Category: FailureFlavorUnavailable,
+			Flavors:  sets.New(flavorName),
+		}, "flavor %s not found", flavorName)
 		return false, nil
 	}
 
@@ -870,7 +921,11 @@ func (a *FlavorAssigner) checkFlavorForPodSets(
 			ps := &a.wl.Obj.Spec.PodSets[psID]
 			if message := checkPodSetAndFlavorMatchForTAS(a.cq, ps, flavor); message != nil {
 				log.Error(nil, *message)
-				status.appendf("%s", *message)
+				status.addReason(FailureReason{
+					Category:     FailureTASConstraints,
+					Flavors:      sets.New(flavorName),
+					TopologyName: flavor.Spec.TopologyName,
+				}, "%s", *message)
 				return false, nil
 			}
 		}
@@ -879,7 +934,10 @@ func (a *FlavorAssigner) checkFlavorForPodSets(
 			return t.Effect == corev1.TaintEffectNoSchedule || t.Effect == corev1.TaintEffectNoExecute
 		}, true)
 		if untolerated {
-			status.appendf("untolerated taint %s in flavor %s", taint, flavorName)
+			status.addReason(FailureReason{
+				Category: FailureFlavorUnsuitable,
+				Flavors:  sets.New(flavorName),
+			}, "untolerated taint %s in flavor %s", taint, flavorName)
 			return false, nil
 		}
 		selector := selectors[psIdx]
@@ -888,7 +946,10 @@ func (a *FlavorAssigner) checkFlavorForPodSets(
 				status.err = err
 				return false, err
 			}
-			status.appendf("flavor %s doesn't match node affinity", flavorName)
+			status.addReason(FailureReason{
+				Category: FailureFlavorUnsuitable,
+				Flavors:  sets.New(flavorName),
+			}, "flavor %s doesn't match node affinity", flavorName)
 			return false, nil
 		}
 	}
@@ -975,7 +1036,11 @@ func (a *FlavorAssigner) fitsResourceQuota(log logr.Logger, fr resources.FlavorR
 
 	// No Fit
 	if val > maxCapacity {
-		status.appendf("insufficient quota for %s in flavor %s, previously considered podsets requests (%s) + current podset request (%s) > maximum capacity (%s)",
+		status.addReason(FailureReason{
+			Category:  FailureQuotaInsufficient,
+			Resources: sets.New(fr.Resource),
+			Flavors:   sets.New(fr.Flavor),
+		}, "insufficient quota for %s in flavor %s, previously considered podsets requests (%s) + current podset request (%s) > maximum capacity (%s)",
 			fr.Resource, fr.Flavor, resources.ResourceQuantityString(fr.Resource, assumedUsage), resources.ResourceQuantityString(fr.Resource, requestUsage), resources.ResourceQuantityString(fr.Resource, maxCapacity))
 		return noFit, 0, &status
 	}
@@ -987,7 +1052,11 @@ func (a *FlavorAssigner) fitsResourceQuota(log logr.Logger, fr resources.FlavorR
 	}
 
 	// Preempt
-	status.appendf("insufficient unused quota for %s in flavor %s, %s more needed",
+	status.addReason(FailureReason{
+		Category:  FailureQuotaInsufficient,
+		Resources: sets.New(fr.Resource),
+		Flavors:   sets.New(fr.Flavor),
+	}, "insufficient unused quota for %s in flavor %s, %s more needed",
 		fr.Resource, fr.Flavor, resources.ResourceQuantityString(fr.Resource, val-available))
 
 	if val <= rQuota.Nominal || mayReclaimInHierarchy || a.canPreemptWhileBorrowing() {

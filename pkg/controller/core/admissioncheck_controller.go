@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -138,7 +139,12 @@ func (r *AdmissionCheckReconciler) Create(e event.TypedCreateEvent[*kueue.Admiss
 	log := r.logger()
 	log.WithValues("admissionCheck", klog.KObj(e.Object)).V(5).Info("Create event")
 	if cqNames := r.cache.AddOrUpdateAdmissionCheck(log, e.Object); len(cqNames) > 0 {
-		r.qManager.QueueInadmissibleWorkloads(context.Background(), cqNames)
+		r.qManager.QueueInadmissibleByCategory(
+			context.Background(),
+			cqNames,
+			qcache.InadmissibleAdmissionCheck,
+			qcache.InadmissibleDetails{AdmissionChecks: sets.New(kueue.AdmissionCheckReference(e.Object.Name))},
+		)
 	}
 	return true
 }
@@ -151,7 +157,12 @@ func (r *AdmissionCheckReconciler) Update(e event.TypedUpdateEvent[*kueue.Admiss
 		return true
 	}
 	if cqNames := r.cache.AddOrUpdateAdmissionCheck(log, e.ObjectNew); len(cqNames) > 0 {
-		r.qManager.QueueInadmissibleWorkloads(context.Background(), cqNames)
+		r.qManager.QueueInadmissibleByCategory(
+			context.Background(),
+			cqNames,
+			qcache.InadmissibleAdmissionCheck,
+			qcache.InadmissibleDetails{AdmissionChecks: sets.New(kueue.AdmissionCheckReference(e.ObjectNew.Name))},
+		)
 	}
 	return false
 }
@@ -162,7 +173,12 @@ func (r *AdmissionCheckReconciler) Delete(e event.TypedDeleteEvent[*kueue.Admiss
 	log.WithValues("admissionCheck", klog.KObj(e.Object)).V(5).Info("Delete event")
 
 	if cqNames := r.cache.DeleteAdmissionCheck(log, e.Object); len(cqNames) > 0 {
-		r.qManager.QueueInadmissibleWorkloads(context.Background(), cqNames)
+		r.qManager.QueueInadmissibleByCategory(
+			context.Background(),
+			cqNames,
+			qcache.InadmissibleAdmissionCheck,
+			qcache.InadmissibleDetails{AdmissionChecks: sets.New(kueue.AdmissionCheckReference(e.Object.Name))},
+		)
 	}
 	return true
 }

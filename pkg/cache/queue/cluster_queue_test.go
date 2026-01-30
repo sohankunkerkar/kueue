@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	testingclock "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 
@@ -59,6 +60,18 @@ var (
 	}
 )
 
+func inadmissibleInfos(iw inadmissibleWorkloads) map[workload.Reference]*workload.Info {
+	infoMap := make(map[workload.Reference]*workload.Info, len(iw))
+	for key, entry := range iw {
+		infoMap[key] = entry.info
+	}
+	return infoMap
+}
+
+func inadmissibleEntryForInfo(info *workload.Info) *inadmissibleEntry {
+	return &inadmissibleEntry{info: info, category: InadmissibleUnknown}
+}
+
 func Test_PushOrUpdate(t *testing.T) {
 	now := time.Now()
 	minuteLater := now.Add(time.Minute)
@@ -72,7 +85,7 @@ func Test_PushOrUpdate(t *testing.T) {
 	cases := map[string]struct {
 		workload                  *utiltestingapi.WorkloadWrapper
 		wantWorkload              *workload.Info
-		wantInAdmissibleWorkloads inadmissibleWorkloads
+		wantInAdmissibleWorkloads map[workload.Reference]*workload.Info
 	}{
 		"workload doesn't have re-queue state": {
 			workload:     wlBase.Clone(),
@@ -90,7 +103,7 @@ func Test_PushOrUpdate(t *testing.T) {
 					Type:   kueue.WorkloadRequeued,
 					Status: metav1.ConditionFalse,
 				}),
-			wantInAdmissibleWorkloads: inadmissibleWorkloads{
+			wantInAdmissibleWorkloads: map[workload.Reference]*workload.Info{
 				"default/workload-1": workload.NewInfo(wlBase.Clone().
 					ResourceVersion("1").
 					RequeueState(ptr.To[int32](10), ptr.To(metav1.NewTime(minuteLater))).
@@ -117,7 +130,7 @@ func Test_PushOrUpdate(t *testing.T) {
 					Type:   kueue.WorkloadRequeued,
 					Status: metav1.ConditionFalse,
 				}),
-			wantInAdmissibleWorkloads: inadmissibleWorkloads{
+			wantInAdmissibleWorkloads: map[workload.Reference]*workload.Info{
 				"default/workload-1": workload.NewInfo(wlBase.Clone().
 					ResourceVersion("1").
 					Condition(metav1.Condition{
@@ -180,7 +193,7 @@ func Test_PushOrUpdate(t *testing.T) {
 			if diff := cmp.Diff(tc.wantWorkload, newWl, cmpOpts...); len(diff) != 0 {
 				t.Errorf("Unexpected workloads in heap (-want,+got):\n%s", diff)
 			}
-			if diff := cmp.Diff(tc.wantInAdmissibleWorkloads, cq.inadmissibleWorkloads, cmpOpts...); len(diff) != 0 {
+			if diff := cmp.Diff(tc.wantInAdmissibleWorkloads, inadmissibleInfos(cq.inadmissibleWorkloads), cmpOpts...); len(diff) != 0 {
 				t.Errorf("Unexpected inadmissibleWorkloads (-want,+got):\n%s", diff)
 			}
 		})
@@ -285,7 +298,7 @@ func Test_DeleteFromLocalQueue(t *testing.T) {
 
 	for _, w := range inadmissibleWorkloads {
 		wInfo := workload.NewInfo(w)
-		cq.requeueIfNotPresent(log, wInfo, false)
+		cq.requeueIfNotPresent(log, inadmissibleEntryForInfo(wInfo), false)
 		qImpl.AddOrUpdate(wInfo)
 	}
 
@@ -443,10 +456,10 @@ func TestClusterQueueImpl(t *testing.T) {
 			}
 
 			for _, w := range test.inadmissibleWorkloadsToRequeue {
-				cq.requeueIfNotPresent(log, w, false)
+				cq.requeueIfNotPresent(log, inadmissibleEntryForInfo(w), false)
 			}
 			for _, w := range test.admissibleWorkloadsToRequeue {
-				cq.requeueIfNotPresent(log, w, true)
+				cq.requeueIfNotPresent(log, inadmissibleEntryForInfo(w), true)
 			}
 
 			for _, w := range test.workloadsToUpdate {
@@ -493,7 +506,7 @@ func TestQueueInadmissibleWorkloadsDuringScheduling(t *testing.T) {
 	// Simulate requeuing during scheduling attempt.
 	head := cq.Pop()
 	cq.QueueInadmissibleWorkloads(ctx, cl)
-	cq.requeueIfNotPresent(log, head, false)
+	cq.requeueIfNotPresent(log, inadmissibleEntryForInfo(head), false)
 
 	activeWorkloads, _ = cq.Dump()
 	wantActiveWorkloads = []workload.Reference{workload.Key(wl)}
@@ -503,7 +516,7 @@ func TestQueueInadmissibleWorkloadsDuringScheduling(t *testing.T) {
 
 	// Simulating scheduling again without requeuing.
 	head = cq.Pop()
-	cq.requeueIfNotPresent(log, head, false)
+	cq.requeueIfNotPresent(log, inadmissibleEntryForInfo(head), false)
 	activeWorkloads, _ = cq.Dump()
 	wantActiveWorkloads = nil
 	if diff := cmp.Diff(wantActiveWorkloads, activeWorkloads, cmpDump...); diff != "" {
@@ -570,6 +583,65 @@ func TestBackoffWaitingTimeExpired(t *testing.T) {
 	}
 }
 
+func TestDetailsMatch(t *testing.T) {
+	flavorA := kueue.ResourceFlavorReference("flavor-a")
+	flavorB := kueue.ResourceFlavorReference("flavor-b")
+	resCPU := corev1.ResourceCPU
+	resGPU := corev1.ResourceName("nvidia.com/gpu")
+
+	tests := []struct {
+		name    string
+		entry   InadmissibleDetails
+		trigger InadmissibleDetails
+		want    bool
+	}{
+		{
+			name:    "empty trigger matches anything",
+			entry:   InadmissibleDetails{Resources: sets.New(resCPU)},
+			trigger: InadmissibleDetails{},
+			want:    true,
+		},
+		{
+			name:    "empty entry matches trigger",
+			entry:   InadmissibleDetails{},
+			trigger: InadmissibleDetails{Resources: sets.New(resCPU)},
+			want:    true,
+		},
+		{
+			name:    "resource overlap matches",
+			entry:   InadmissibleDetails{Resources: sets.New(resCPU, resGPU)},
+			trigger: InadmissibleDetails{Resources: sets.New(resGPU)},
+			want:    true,
+		},
+		{
+			name:    "resource mismatch fails",
+			entry:   InadmissibleDetails{Resources: sets.New(resCPU)},
+			trigger: InadmissibleDetails{Resources: sets.New(resGPU)},
+			want:    false,
+		},
+		{
+			name:    "flavor overlap matches",
+			entry:   InadmissibleDetails{Flavors: sets.New(flavorA, flavorB)},
+			trigger: InadmissibleDetails{Flavors: sets.New(flavorB)},
+			want:    true,
+		},
+		{
+			name:    "flavor mismatch fails",
+			entry:   InadmissibleDetails{Flavors: sets.New(flavorA)},
+			trigger: InadmissibleDetails{Flavors: sets.New(flavorB)},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detailsMatch(tt.entry, tt.trigger); got != tt.want {
+				t.Errorf("detailsMatch() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBestEffortFIFORequeueIfNotPresent(t *testing.T) {
 	tests := map[string]struct {
 		reason           RequeueReason
@@ -630,7 +702,7 @@ func TestBestEffortFIFORequeueIfNotPresent(t *testing.T) {
 			wl := utiltestingapi.MakeWorkload("workload-1", defaultNamespace).Obj()
 			info := workload.NewInfo(wl)
 			info.LastAssignment = tc.lastAssignment
-			if ok := cq.RequeueIfNotPresent(ctx, info, tc.reason); !ok {
+			if ok := cq.RequeueIfNotPresent(ctx, info, tc.reason, InadmissibleUnknown, InadmissibleDetails{}); !ok {
 				t.Error("failed to requeue nonexistent workload")
 			}
 
@@ -639,7 +711,7 @@ func TestBestEffortFIFORequeueIfNotPresent(t *testing.T) {
 				t.Errorf("Unexpected inadmissible status (-want,+got):\n%s", diff)
 			}
 
-			if ok := cq.RequeueIfNotPresent(ctx, workload.NewInfo(wl), tc.reason); ok {
+			if ok := cq.RequeueIfNotPresent(ctx, workload.NewInfo(wl), tc.reason, InadmissibleUnknown, InadmissibleDetails{}); ok {
 				t.Error("Re-queued a workload that was already present")
 			}
 		})
@@ -859,7 +931,7 @@ func TestStrictFIFORequeueIfNotPresent(t *testing.T) {
 				workload.Ordering{PodsReadyRequeuingTimestamp: config.EvictionTimestamp},
 				nil, nil, nil)
 			wl := utiltestingapi.MakeWorkload("workload-1", defaultNamespace).Obj()
-			if ok := cq.RequeueIfNotPresent(ctx, workload.NewInfo(wl), reason); !ok {
+			if ok := cq.RequeueIfNotPresent(ctx, workload.NewInfo(wl), reason, InadmissibleUnknown, InadmissibleDetails{}); !ok {
 				t.Error("failed to requeue nonexistent workload")
 			}
 
@@ -868,7 +940,7 @@ func TestStrictFIFORequeueIfNotPresent(t *testing.T) {
 				t.Errorf("Got inadmissible after requeue %t, want %t", gotInadmissible, test.wantInadmissible)
 			}
 
-			if ok := cq.RequeueIfNotPresent(ctx, workload.NewInfo(wl), reason); ok {
+			if ok := cq.RequeueIfNotPresent(ctx, workload.NewInfo(wl), reason, InadmissibleUnknown, InadmissibleDetails{}); ok {
 				t.Error("Re-queued a workload that was already present")
 			}
 		})

@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -38,6 +40,7 @@ import (
 	utilindexer "sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
+	"sigs.k8s.io/kueue/pkg/resources"
 	afs "sigs.k8s.io/kueue/pkg/util/admissionfairsharing"
 	"sigs.k8s.io/kueue/pkg/util/queue"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
@@ -571,7 +574,7 @@ func (m *Manager) AddOrUpdateWorkloadWithoutLock(log logr.Logger, w *kueue.Workl
 // RequeueWorkload requeues the workload ensuring that the queue and the
 // workload still exist in the client cache and not admitted. It won't
 // requeue if the workload is already in the queue (possible if the workload was updated).
-func (m *Manager) RequeueWorkload(ctx context.Context, info *workload.Info, reason RequeueReason) bool {
+func (m *Manager) RequeueWorkload(ctx context.Context, info *workload.Info, reason RequeueReason, category InadmissibleCategory, details InadmissibleDetails) bool {
 	m.Lock()
 	defer m.Unlock()
 
@@ -597,7 +600,7 @@ func (m *Manager) RequeueWorkload(ctx context.Context, info *workload.Info, reas
 		return false
 	}
 
-	added := cq.RequeueIfNotPresent(ctx, info, reason)
+	added := cq.RequeueIfNotPresent(ctx, info, reason, category, details)
 	m.reportPendingWorkloads(q.ClusterQueue, cq)
 	if features.Enabled(features.LocalQueueMetrics) {
 		m.reportLQPendingWorkloads(q)
@@ -667,7 +670,7 @@ func (m *Manager) deleteWorkloadWithoutLock(log logr.Logger, wlKey workload.Refe
 // An optional action can be executed at the beginning of the function,
 // while holding the lock, to provide atomicity with the operations in the
 // queues.
-func (m *Manager) QueueAssociatedInadmissibleWorkloadsAfter(ctx context.Context, wlKey workload.Reference, action func()) {
+func (m *Manager) QueueAssociatedInadmissibleWorkloadsAfter(ctx context.Context, wlKey workload.Reference, wl *kueue.Workload, action func()) {
 	m.Lock()
 	defer m.Unlock()
 	if action != nil {
@@ -687,7 +690,18 @@ func (m *Manager) QueueAssociatedInadmissibleWorkloadsAfter(ctx context.Context,
 		return
 	}
 
-	if m.requeueWorkloadsCQ(ctx, cq) {
+	category := InadmissibleQuotaInsufficient
+	details := inadmissibleDetailsFromWorkload(wl)
+	if wl == nil {
+		category = InadmissibleUnknown
+	}
+	if !features.Enabled(features.StatefulInadmissibility) {
+		if m.requeueWorkloadsCQ(ctx, cq) {
+			m.Broadcast()
+		}
+		return
+	}
+	if m.requeueWorkloadsCQByCategory(ctx, cq, category, details) {
 		m.Broadcast()
 	}
 }
@@ -701,7 +715,66 @@ func (m *Manager) QueueInadmissibleWorkloads(ctx context.Context, cqNames sets.S
 	if len(cqNames) == 0 {
 		return
 	}
+	m.queueInadmissibleWorkloadsLocked(ctx, cqNames)
+}
 
+// QueueInadmissibleByCategory selectively requeues inadmissible workloads
+// that match the given category and details. Falls back to full requeue
+// when StatefulInadmissibility feature is disabled.
+func (m *Manager) QueueInadmissibleByCategory(ctx context.Context, cqNames sets.Set[kueue.ClusterQueueReference], category InadmissibleCategory, details InadmissibleDetails) {
+	m.Lock()
+	defer m.Unlock()
+	if len(cqNames) == 0 {
+		return
+	}
+	if !features.Enabled(features.StatefulInadmissibility) {
+		m.queueInadmissibleWorkloadsLocked(ctx, cqNames)
+		return
+	}
+
+	processedRoots := sets.New[kueue.CohortReference]()
+	var queued bool
+	for name := range cqNames {
+		cq := m.hm.ClusterQueue(name)
+		if cq == nil {
+			continue
+		}
+		if cq.HasParent() && !hierarchy.HasCycle(cq.Parent()) {
+			rootName := cq.Parent().getRootUnsafe().GetName()
+			if processedRoots.Has(rootName) {
+				continue
+			}
+			processedRoots.Insert(rootName)
+		}
+		if m.requeueWorkloadsCQByCategory(ctx, cq, category, details) {
+			queued = true
+		}
+	}
+
+	if queued {
+		m.Broadcast()
+	}
+}
+
+// QueueInadmissibleExpired requeues workloads that have been inadmissible
+// for longer than maxDuration. Acts as a safety valve to ensure workloads
+// are not stuck indefinitely if a trigger event was missed.
+func (m *Manager) QueueInadmissibleExpired(ctx context.Context, maxDuration time.Duration) {
+	m.Lock()
+	defer m.Unlock()
+	if !features.Enabled(features.StatefulInadmissibility) {
+		return
+	}
+	var queued bool
+	for _, cq := range m.hm.ClusterQueues() {
+		queued = cq.QueueInadmissibleExpired(ctx, m.client, maxDuration) || queued
+	}
+	if queued {
+		m.Broadcast()
+	}
+}
+
+func (m *Manager) queueInadmissibleWorkloadsLocked(ctx context.Context, cqNames sets.Set[kueue.ClusterQueueReference]) {
 	// Track processed cohort roots to avoid requeuing the same hierarchy
 	// multiple times when multiple CQs in cqNames share a root.
 	processedRoots := sets.New[kueue.CohortReference]()
@@ -744,10 +817,28 @@ func (m *Manager) QueueInadmissibleWorkloads(ctx context.Context, cqNames sets.S
 // or otherwise risk encountering an infinite loop if a Cohort
 // cycle is introduced.
 func (m *Manager) requeueWorkloadsCQ(ctx context.Context, cq *ClusterQueue) bool {
+	return m.requeueWorkloadsCQWithFunc(ctx, cq, func(cq *ClusterQueue) bool {
+		return cq.QueueInadmissibleWorkloads(ctx, m.client)
+	})
+}
+
+func (m *Manager) requeueWorkloadsCQByCategory(ctx context.Context, cq *ClusterQueue, category InadmissibleCategory, details InadmissibleDetails) bool {
+	return m.requeueWorkloadsCQWithFunc(ctx, cq, func(cq *ClusterQueue) bool {
+		return cq.QueueInadmissibleByCategory(ctx, m.client, category, details)
+	})
+}
+
+func (m *Manager) requeueWorkloadsCQWithFunc(ctx context.Context, cq *ClusterQueue, requeueFunc func(*ClusterQueue) bool) bool {
 	if cq.HasParent() {
-		return m.requeueWorkloadsCohort(ctx, cq.Parent())
+		return m.requeueWorkloadsCohortWithFunc(ctx, cq.Parent(), requeueFunc)
 	}
-	return cq.QueueInadmissibleWorkloads(ctx, m.client)
+	return requeueFunc(cq)
+}
+
+func (m *Manager) requeueWorkloadsCohort(ctx context.Context, cohort *cohort) bool {
+	return m.requeueWorkloadsCohortWithFunc(ctx, cohort, func(cq *ClusterQueue) bool {
+		return cq.QueueInadmissibleWorkloads(ctx, m.client)
+	})
 }
 
 // moveWorkloadsCohorts checks for a cycle, the moves all inadmissible
@@ -757,7 +848,7 @@ func (m *Manager) requeueWorkloadsCQ(ctx context.Context, cq *ClusterQueue) bool
 // WARNING: must hold a read-lock on the manager when calling,
 // or otherwise risk encountering an infinite loop if a Cohort
 // cycle is introduced.
-func (m *Manager) requeueWorkloadsCohort(ctx context.Context, cohort *cohort) bool {
+func (m *Manager) requeueWorkloadsCohortWithFunc(ctx context.Context, cohort *cohort, requeueFunc func(*ClusterQueue) bool) bool {
 	log := ctrl.LoggerFrom(ctx)
 
 	if hierarchy.HasCycle(cohort) {
@@ -766,18 +857,40 @@ func (m *Manager) requeueWorkloadsCohort(ctx context.Context, cohort *cohort) bo
 	}
 	root := cohort.getRootUnsafe()
 	log.V(2).Info("Attempting to move workloads", "cohort", cohort.Name, "root", root.Name)
-	return requeueWorkloadsCohortSubtree(ctx, m, root)
+	return requeueWorkloadsCohortSubtreeWithFunc(ctx, m, root, requeueFunc)
 }
 
-func requeueWorkloadsCohortSubtree(ctx context.Context, m *Manager, cohort *cohort) bool {
+func requeueWorkloadsCohortSubtreeWithFunc(ctx context.Context, m *Manager, cohort *cohort, requeueFunc func(*ClusterQueue) bool) bool {
 	queued := false
 	for _, clusterQueue := range cohort.ChildCQs() {
-		queued = clusterQueue.QueueInadmissibleWorkloads(ctx, m.client) || queued
+		queued = requeueFunc(clusterQueue) || queued
 	}
 	for _, childCohort := range cohort.ChildCohorts() {
-		queued = requeueWorkloadsCohortSubtree(ctx, m, childCohort) || queued
+		queued = requeueWorkloadsCohortSubtreeWithFunc(ctx, m, childCohort, requeueFunc) || queued
 	}
 	return queued
+}
+
+func inadmissibleDetailsFromWorkload(wl *kueue.Workload) InadmissibleDetails {
+	if wl == nil {
+		return InadmissibleDetails{}
+	}
+	info := workload.NewInfo(wl)
+	return detailsFromUsage(info.FlavorResourceUsage())
+}
+
+func detailsFromUsage(usage resources.FlavorResourceQuantities) InadmissibleDetails {
+	details := InadmissibleDetails{
+		Resources: sets.New[corev1.ResourceName](),
+		Flavors:   sets.New[kueue.ResourceFlavorReference](),
+	}
+	for fr := range usage {
+		details.Resources.Insert(fr.Resource)
+		if fr.Flavor != "" {
+			details.Flavors.Insert(fr.Flavor)
+		}
+	}
+	return details
 }
 
 // UpdateWorkload updates the workload to the corresponding queue or adds it if

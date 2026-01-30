@@ -237,6 +237,12 @@ const (
 	// issue: https://github.com/kubernetes-sigs/kueue/issues/8190
 	// Enables TLSOptions for TLS MinVersion and CipherSuites for kueue servers
 	TLSOptions featuregate.Feature = "TLSOptions"
+
+	// owner: @sohankunkerkar
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/8095-stateful-inadmissibility
+	//
+	// Enables stateful inadmissibility with selective requeue.
+	StatefulInadmissibility featuregate.Feature = "StatefulInadmissibility"
 )
 
 func init() {
@@ -368,6 +374,9 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	},
 	TLSOptions: {
 		{Version: version.MustParse("0.16"), Default: true, PreRelease: featuregate.Beta}, // GA in 0.18
+	},
+	StatefulInadmissibility: {
+		{Version: version.MustParse("0.16"), Default: false, PreRelease: featuregate.Alpha},
 	},
 }
 
