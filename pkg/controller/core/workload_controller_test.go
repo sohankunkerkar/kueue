@@ -464,6 +464,50 @@ func TestReconcile(t *testing.T) {
 				Obj(),
 			wantEvents: nil,
 		},
+		"reconcile claim-only ResourceClaim should be rejected when DRA gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{
+				features.DynamicResourceAllocation:        false,
+				features.MultiKueueOrchestratedPreemption: false,
+			},
+			workload: utiltestingapi.MakeWorkload("wlWithDisabledDRAResourceClaim", "ns").
+				Queue("lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaim("gpu", "rc1").
+					Obj()).
+				Obj(),
+			resourceClaims: []*resourcev1.ResourceClaim{
+				utiltesting.MakeResourceClaim("rc1", "ns").
+					DeviceRequest("", "gpu.example.com", 1).
+					Obj(),
+			},
+			cq: utiltestingapi.MakeClusterQueue("cq").
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("flavor1").
+						Resource(corev1.ResourceCPU, "2").
+						Resource(corev1.ResourceMemory, "2Gi").
+						Obj(),
+				).Obj(),
+			lq: utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj(),
+			wantWorkload: utiltestingapi.MakeWorkload("wlWithDisabledDRAResourceClaim", "ns").
+				Queue("lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaim("gpu", "rc1").
+					Obj()).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadQuotaReserved,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadInadmissible,
+					Message: "Workload uses claim-based DRA resources but the DynamicResourceAllocation feature gate is not enabled",
+				}).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadRequeued,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadInadmissible,
+					Message: "Workload uses claim-based DRA resources but the DynamicResourceAllocation feature gate is not enabled",
+				}).
+				Obj(),
+			wantEvents: nil,
+		},
 		"reconcile DRA ResourceClaimTemplate should be pre-processed and queued": {
 			featureGates: map[featuregate.Feature]bool{
 				features.DynamicResourceAllocation:        true,
@@ -491,6 +535,86 @@ func TestReconcile(t *testing.T) {
 			wantWorkload: utiltestingapi.MakeWorkload("wlWithDRAResourceClaimTemplate", "ns").
 				Queue("lq").
 				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaimTemplate("gpu", "gpu-template").
+					Obj()).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadQuotaReserved,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadInadmissible,
+					Message: "ClusterQueue cq is inactive",
+				}).
+				Obj(),
+			wantEvents: nil,
+		},
+		"reconcile claim-only ResourceClaimTemplate should be rejected when DRA gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{
+				features.DynamicResourceAllocation:        false,
+				features.MultiKueueOrchestratedPreemption: false,
+			},
+			workload: utiltestingapi.MakeWorkload("wlWithDisabledDRAResourceClaimTemplate", "ns").
+				Queue("lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaimTemplate("gpu", "gpu-template").
+					Obj()).
+				Obj(),
+			resourceClaimTemplates: []*resourcev1.ResourceClaimTemplate{
+				utiltesting.MakeResourceClaimTemplate("gpu-template", "ns").
+					DeviceRequest("gpu-request", "gpu.example.com", 1).
+					Obj(),
+			},
+			cq: utiltestingapi.MakeClusterQueue("cq").
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("flavor1").
+						Resource(corev1.ResourceCPU, "2").
+						Resource(corev1.ResourceMemory, "2Gi").
+						Obj(),
+				).Obj(),
+			lq: utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj(),
+			wantWorkload: utiltestingapi.MakeWorkload("wlWithDisabledDRAResourceClaimTemplate", "ns").
+				Queue("lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaimTemplate("gpu", "gpu-template").
+					Obj()).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadQuotaReserved,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadInadmissible,
+					Message: "Workload uses claim-based DRA resources but the DynamicResourceAllocation feature gate is not enabled",
+				}).
+				Condition(metav1.Condition{
+					Type:    kueue.WorkloadRequeued,
+					Status:  metav1.ConditionFalse,
+					Reason:  kueue.WorkloadInadmissible,
+					Message: "Workload uses claim-based DRA resources but the DynamicResourceAllocation feature gate is not enabled",
+				}).
+				Obj(),
+			wantEvents: nil,
+		},
+		"reconcile mixed workload with extended resources should skip DRA path when gate is disabled": {
+			featureGates: map[featuregate.Feature]bool{
+				features.DynamicResourceAllocation:        false,
+				features.MultiKueueOrchestratedPreemption: false,
+			},
+			workload: utiltestingapi.MakeWorkload("wlWithDisabledMixedDRA", "ns").
+				Queue("lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					Request("nvidia.com/gpu", "1").
+					ResourceClaimTemplate("gpu", "gpu-template").
+					Obj()).
+				Obj(),
+			cq: utiltestingapi.MakeClusterQueue("cq").
+				ResourceGroup(
+					*utiltestingapi.MakeFlavorQuotas("flavor1").
+						Resource(corev1.ResourceCPU, "2").
+						Resource(corev1.ResourceMemory, "2Gi").
+						Resource("nvidia.com/gpu", "2").
+						Obj(),
+				).Obj(),
+			lq: utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj(),
+			wantWorkload: utiltestingapi.MakeWorkload("wlWithDisabledMixedDRA", "ns").
+				Queue("lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					Request("nvidia.com/gpu", "1").
 					ResourceClaimTemplate("gpu", "gpu-template").
 					Obj()).
 				Condition(metav1.Condition{

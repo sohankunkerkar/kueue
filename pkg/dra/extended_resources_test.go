@@ -33,7 +33,9 @@ import (
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/features"
 	utilresource "sigs.k8s.io/kueue/pkg/util/resource"
+	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 )
 
 func newFakeClient(deviceClasses ...*resourceapi.DeviceClass) client.Client {
@@ -105,6 +107,86 @@ func TestIsExtendedResourceName(t *testing.T) {
 			got := utilresource.IsExtendedResourceName(tt.resource)
 			if got != tt.want {
 				t.Errorf("utilresource.IsExtendedResourceName(%s) = %v, want %v", tt.resource, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNeedsDRAReconcile(t *testing.T) {
+	workloadWithRCT := utiltestingapi.MakeWorkload("wl-rct", "ns").
+		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+			ResourceClaimTemplate("gpu", "gpu-template").
+			Obj()).
+		Obj()
+	workloadWithMixedClaims := utiltestingapi.MakeWorkload("wl-mixed", "ns").
+		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+			Request("nvidia.com/gpu", "1").
+			ResourceClaimTemplate("gpu", "gpu-template").
+			Obj()).
+		Obj()
+	workloadWithExtendedResource := utiltestingapi.MakeWorkload("wl-ext", "ns").
+		PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+			Request("nvidia.com/gpu", "1").
+			Obj()).
+		Obj()
+
+	tests := []struct {
+		name            string
+		workload        *kueue.Workload
+		draEnabled      bool
+		extendedEnabled bool
+		want            bool
+	}{
+		{
+			name:            "resource claim template is reconciled when DRA enabled",
+			workload:        workloadWithRCT,
+			draEnabled:      true,
+			extendedEnabled: false,
+			want:            true,
+		},
+		{
+			name:            "claim-only workload is reconciled when DRA disabled for rejection",
+			workload:        workloadWithRCT,
+			draEnabled:      false,
+			extendedEnabled: false,
+			want:            true,
+		},
+		{
+			name:            "extended resource uses reconcile when both gates enabled",
+			workload:        workloadWithExtendedResource,
+			draEnabled:      true,
+			extendedEnabled: true,
+			want:            true,
+		},
+		{
+			name:            "extended resource skips reconcile when extended resource gate disabled",
+			workload:        workloadWithExtendedResource,
+			draEnabled:      true,
+			extendedEnabled: false,
+			want:            false,
+		},
+		{
+			name:            "mixed workload is reconciled when DRA enabled",
+			workload:        workloadWithMixedClaims,
+			draEnabled:      true,
+			extendedEnabled: false,
+			want:            true,
+		},
+		{
+			name:            "mixed workload skips DRA path when DRA disabled",
+			workload:        workloadWithMixedClaims,
+			draEnabled:      false,
+			extendedEnabled: false,
+			want:            false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.DynamicResourceAllocation, tt.draEnabled)
+			features.SetFeatureGateDuringTest(t, features.DRAExtendedResources, tt.extendedEnabled)
+			if got := NeedsDRAReconcile(tt.workload); got != tt.want {
+				t.Fatalf("NeedsDRAReconcile() = %v, want %v", got, tt.want)
 			}
 		})
 	}

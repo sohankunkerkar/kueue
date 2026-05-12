@@ -1395,6 +1395,24 @@ func HasDRA(w *kueue.Workload) bool {
 	return HasResourceClaim(w) || HasResourceClaimTemplates(w)
 }
 
+// HasExtendedResourceRequests returns true if any podset container or init container
+// requests a non-zero extended resource.
+func HasExtendedResourceRequests(w *kueue.Workload) bool {
+	for i := range w.Spec.PodSets {
+		ps := &w.Spec.PodSets[i]
+		for _, containers := range [][]corev1.Container{ps.Template.Spec.InitContainers, ps.Template.Spec.Containers} {
+			for _, c := range containers {
+				for name, qty := range c.Resources.Requests {
+					if !qty.IsZero() && resource.IsExtendedResourceName(name) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // HasResourceClaimTemplates returns true if the workload has ResourceClaimTemplates.
 func HasResourceClaimTemplates(w *kueue.Workload) bool {
 	for _, ps := range w.Spec.PodSets {

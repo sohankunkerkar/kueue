@@ -35,35 +35,29 @@ import (
 )
 
 // NeedsDRAReconcile returns true if the workload needs DRA processing in Reconcile.
-// Fast in-memory check with no API calls. Uses a broad format-based filter
-// (IsExtendedResourceName) which may over-trigger for non-DRA extended resources,
-// but this only costs one extra Reconcile that finds no DeviceClass and queues normally.
+// Fast in-memory check with no API calls.
 //
-// Note: there is no DeviceClass watcher. If a DeviceClass is created after a workload
-// was marked inadmissible, requeuing depends on the next QueueInadmissibleWorkloads event.
+// When DynamicResourceAllocation is enabled, all claim-based DRA workloads and
+// extended-resource workloads (with DRAExtendedResources) are routed to Reconcile
+// for full DRA processing.
+//
+// When DynamicResourceAllocation is disabled, only claim-only workloads (those
+// with ResourceClaims/ResourceClaimTemplates but no extended resource requests)
+// are routed to Reconcile so they can be rejected as inadmissible. Mixed workloads
+// that also carry extended resource requests (e.g., GB200 with nvidia.com/gpu +
+// ComputeDomain RCT) skip the DRA path entirely so their GPU quota is tracked
+// through the normal PodRequests() path.
 func NeedsDRAReconcile(wl *kueue.Workload) bool {
-	if !features.Enabled(features.DynamicResourceAllocation) {
-		return false
-	}
 	if workload.HasDRA(wl) {
-		return true
+		if features.Enabled(features.DynamicResourceAllocation) {
+			return true
+		}
+		return !workload.HasExtendedResourceRequests(wl)
 	}
-	if !features.Enabled(features.DRAExtendedResources) {
+	if !features.Enabled(features.DynamicResourceAllocation) || !features.Enabled(features.DRAExtendedResources) {
 		return false
 	}
-	for i := range wl.Spec.PodSets {
-		ps := &wl.Spec.PodSets[i]
-		for _, containers := range [][]corev1.Container{ps.Template.Spec.InitContainers, ps.Template.Spec.Containers} {
-			for _, c := range containers {
-				for name, qty := range c.Resources.Requests {
-					if !qty.IsZero() && utilresource.IsExtendedResourceName(name) {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
+	return workload.HasExtendedResourceRequests(wl)
 }
 
 // resolveContainerExtendedResources converts DRA-backed extended resources in a

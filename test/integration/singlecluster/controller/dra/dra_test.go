@@ -1132,4 +1132,151 @@ var _ = ginkgo.Describe("DRA Integration", ginkgo.Ordered, ginkgo.ContinueOnFail
 			}, util.Timeout, util.Interval).Should(gomega.Succeed())
 		})
 	})
+
+	ginkgo.When("DynamicResourceAllocation feature gate disabled", func() {
+		var (
+			ns             *corev1.Namespace
+			resourceFlavor *kueue.ResourceFlavor
+			clusterQueue   *kueue.ClusterQueue
+			localQueue     *kueue.LocalQueue
+			deviceClass    *resourcev1.DeviceClass
+		)
+
+		const extendedResourceName = "example.com/gpu"
+		const disabledMsg = "Workload uses claim-based DRA resources but the DynamicResourceAllocation feature gate is not enabled"
+
+		ginkgo.BeforeAll(func() {
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DynamicResourceAllocation, false)
+			features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.DRAExtendedResources, false)
+			fwk.StopManager(ctx)
+			fwk.StartManager(ctx, cfg, managerSetup(nil))
+		})
+
+		ginkgo.AfterAll(func() {
+			fwk.StopManager(ctx)
+			fwk.StartManager(ctx, cfg, managerSetup(nil))
+		})
+
+		ginkgo.BeforeEach(func() {
+			ns = &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "dra-disabled-",
+				},
+			}
+			gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+
+			deviceClass = &resourcev1.DeviceClass{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "gpu-disabled.example.com",
+				},
+				Spec: resourcev1.DeviceClassSpec{
+					ExtendedResourceName: ptr.To(extendedResourceName),
+				},
+			}
+			gomega.Expect(k8sClient.Create(ctx, deviceClass)).To(gomega.Succeed())
+
+			resourceFlavor = utiltestingapi.MakeResourceFlavor("").Obj()
+			resourceFlavor.GenerateName = "rf-dra-disabled-"
+			gomega.Expect(k8sClient.Create(ctx, resourceFlavor)).To(gomega.Succeed())
+
+			clusterQueue = &kueue.ClusterQueue{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "dra-disabled-cq-",
+				},
+				Spec: kueue.ClusterQueueSpec{
+					NamespaceSelector: &metav1.LabelSelector{},
+					ResourceGroups: []kueue.ResourceGroup{
+						{
+							CoveredResources: []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, extendedResourceName},
+							Flavors: []kueue.FlavorQuotas{
+								{
+									Name: kueue.ResourceFlavorReference(resourceFlavor.Name),
+									Resources: []kueue.ResourceQuota{
+										{Name: corev1.ResourceCPU, NominalQuota: resource.MustParse("10")},
+										{Name: corev1.ResourceMemory, NominalQuota: resource.MustParse("10Gi")},
+										{Name: extendedResourceName, NominalQuota: resource.MustParse("4")},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			gomega.Expect(k8sClient.Create(ctx, clusterQueue)).To(gomega.Succeed())
+			util.ExpectClusterQueuesToBeActive(ctx, k8sClient, clusterQueue)
+
+			localQueue = utiltestingapi.MakeLocalQueue("dra-disabled-lq", ns.Name).
+				ClusterQueue(clusterQueue.Name).Obj()
+			gomega.Expect(k8sClient.Create(ctx, localQueue)).To(gomega.Succeed())
+		})
+
+		ginkgo.AfterEach(func() {
+			gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+			util.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
+			util.ExpectObjectToBeDeleted(ctx, k8sClient, resourceFlavor, true)
+			util.ExpectObjectToBeDeleted(ctx, k8sClient, deviceClass, true)
+		})
+
+		ginkgo.It("Should reject claim-only ResourceClaimTemplate workloads", func() {
+			ginkgo.By("Creating a ResourceClaimTemplate")
+			rct := utiltesting.MakeResourceClaimTemplate("claim-only-template", ns.Name).
+				DeviceRequest("gpu-request", deviceClass.Name, 1).
+				Obj()
+			util.MustCreate(ctx, k8sClient, rct)
+
+			ginkgo.By("Creating a workload with claim-only DRA resources")
+			wl := utiltestingapi.MakeWorkload("claim-only-wl", ns.Name).
+				Queue("dra-disabled-lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaimTemplate("gpu", rct.Name).
+					Request(corev1.ResourceCPU, "1").
+					Request(corev1.ResourceMemory, "1Gi").
+					Obj()).
+				Obj()
+			util.MustCreate(ctx, k8sClient, wl)
+
+			ginkgo.By("Verifying workload is rejected as inadmissible")
+			gomega.Eventually(func(g gomega.Gomega) {
+				var updatedWl kueue.Workload
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &updatedWl)).To(gomega.Succeed())
+				g.Expect(workload.HasQuotaReservation(&updatedWl)).To(gomega.BeFalse())
+				g.Expect(updatedWl.Status.Conditions).To(gomega.ContainElement(gomega.And(
+					gomega.HaveField("Type", kueue.WorkloadQuotaReserved),
+					gomega.HaveField("Status", metav1.ConditionFalse),
+					gomega.HaveField("Reason", kueue.WorkloadInadmissible),
+					gomega.HaveField("Message", disabledMsg),
+				)))
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("Should admit mixed workloads that carry GPU quota in extended resource requests", func() {
+			ginkgo.By("Creating a ResourceClaimTemplate")
+			rct := utiltesting.MakeResourceClaimTemplate("mixed-template", ns.Name).
+				DeviceRequest("gpu-request", deviceClass.Name, 1).
+				Obj()
+			util.MustCreate(ctx, k8sClient, rct)
+
+			ginkgo.By("Creating a mixed workload with RCT and extended resource requests")
+			wl := utiltestingapi.MakeWorkload("mixed-wl", ns.Name).
+				Queue("dra-disabled-lq").
+				PodSets(*utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
+					ResourceClaimTemplate("gpu", rct.Name).
+					Request(corev1.ResourceCPU, "1").
+					Request(corev1.ResourceMemory, "1Gi").
+					Request(extendedResourceName, "1").
+					Obj()).
+				Obj()
+			util.MustCreate(ctx, k8sClient, wl)
+
+			ginkgo.By("Verifying workload is admitted with GPU tracked via extended resource")
+			gomega.Eventually(func(g gomega.Gomega) {
+				var updatedWl kueue.Workload
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &updatedWl)).To(gomega.Succeed())
+				g.Expect(workload.HasQuotaReservation(&updatedWl)).To(gomega.BeTrue())
+				g.Expect(updatedWl.Status.Admission).NotTo(gomega.BeNil())
+				g.Expect(updatedWl.Status.Admission.PodSetAssignments).To(gomega.HaveLen(1))
+				g.Expect(updatedWl.Status.Admission.PodSetAssignments[0].ResourceUsage).To(gomega.HaveKey(corev1.ResourceName(extendedResourceName)))
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		})
+	})
 })

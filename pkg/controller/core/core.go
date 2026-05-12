@@ -25,7 +25,6 @@ import (
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
-	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/fairsharing"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
@@ -100,9 +99,7 @@ func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.
 		WithWorkloadCustomLabels(customLabels),
 		WithAdmissionFairSharing(cfg.AdmissionFairSharing),
 	)
-	if features.Enabled(features.DynamicResourceAllocation) {
-		qManager.SetDRAReconcileChannel(workloadRec.GetDRAReconcileChannel())
-	}
+	qManager.SetDRAReconcileChannel(workloadRec.GetDRAReconcileChannel())
 
 	if err := workloadRec.SetupWithManager(mgr, cfg); err != nil {
 		return "Workload", err
