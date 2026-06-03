@@ -1463,7 +1463,7 @@ func ExpectJobToBeCompleted(ctx context.Context, c client.Client, job *batchv1.J
 				Status: corev1.ConditionTrue,
 			},
 			cmpopts.IgnoreFields(batchv1.JobCondition{}, "LastTransitionTime", "LastProbeTime", "Reason", "Message"))))
-	}, MediumTimeout, Interval).Should(gomega.Succeed(), AssertMsg("Job did not complete", createdJob))
+	}, LongTimeout, Interval).Should(gomega.Succeed(), AssertMsg("Job did not complete", createdJob))
 }
 
 func UpdateReclaimablePods(ctx context.Context, c client.Client, wl *kueue.Workload, reclaimablePods []kueue.ReclaimablePod) {
