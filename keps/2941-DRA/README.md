@@ -71,6 +71,7 @@ tags, and then generate with `hack/update-toc.sh`.
     - [Path Interactions](#path-interactions-1)
     - [Capacity Lifecycle Scenarios](#capacity-lifecycle-scenarios)
     - [Validation](#validation-1)
+  - [DRA Device Feasibility](#dra-device-feasibility)
   - [Architecture Details](#architecture-details)
     - [Queue Manager Extensions](#queue-manager-extensions)
   - [Integration with Admission Fair Sharing](#integration-with-admission-fair-sharing)
@@ -87,11 +88,13 @@ tags, and then generate with `hack/update-toc.sh`.
       - [KueueDRAIntegrationExtendedResource (v0.18)](#kueuedraintegrationextendedresource-v018)
       - [KueueDRAIntegrationPartitionableDevices (v0.18)](#kueuedraintegrationpartitionabledevices-v018)
       - [KueueDRAIntegrationConsumableCapacity (v0.19)](#kueuedraintegrationconsumablecapacity-v019)
+      - [KueueDRADeviceFeasibility (v0.20)](#kueuedradevicefeasibility-v020)
     - [Beta](#beta)
       - [KueueDRAIntegration (v0.18)](#kueuedraintegration-v018)
       - [KueueDRAIntegrationExtendedResource](#kueuedraintegrationextendedresource)
       - [KueueDRAIntegrationPartitionableDevices](#kueuedraintegrationpartitionabledevices)
       - [KueueDRAIntegrationConsumableCapacity](#kueuedraintegrationconsumablecapacity)
+      - [KueueDRADeviceFeasibility](#kueuedradevicefeasibility)
     - [GA](#ga)
       - [KueueDRAIntegration](#kueuedraintegration)
       - [KueueDRAIntegrationExtendedResource](#kueuedraintegrationextendedresource-1)
@@ -419,6 +422,9 @@ Feature gates controlling DRA support in Kueue:
   is disabled. Without this gate, DRA workloads submitted while `KueueDRAIntegration` is off
   are silently admitted with zero device resource usage, bypassing quota enforcement entirely.
   See [Workload Rejection When DRA Is Disabled](#workload-rejection-when-dra-is-disabled).
+- `KueueDRADeviceFeasibility` (Alpha): gates per-node DRA device feasibility checking
+  using `structured.Allocator`. Requires `SchedulerLibraryIntegration`.
+  See [DRA Device Feasibility](#dra-device-feasibility).
 
 The following sections will explain the design in detail.
 
@@ -1693,6 +1699,54 @@ inadmissible workload requeuing. No new controller logic is needed.
 - `KueueDRAIntegrationConsumableCapacity` requires `KueueDRAIntegration` to be enabled.
   Validated at startup in `pkg/config/validation.go`.
 
+### DRA Device Feasibility
+
+When `KueueDRADeviceFeasibility` and `SchedulerLibraryIntegration` are both enabled,
+Kueue checks per-node DRA device availability before admitting workloads. Without
+this, Kueue can admit a workload against quota but the kube-scheduler fails to
+allocate devices on the target node.
+
+The check uses `structured.Allocator` from
+`k8s.io/dynamic-resource-allocation/structured`, the same allocation engine that
+kube-scheduler uses. We use `structured.Allocator` instead of the `dynamicresources`
+scheduler plugin for two reasons:
+1. The scheduler-library's `upstreamsync.NewProfileMap` creates the DRA manager
+   internally with no injection point for a custom `SharedDRAManager`.
+2. The `dynamicresources` plugin requires `pod.Status.ResourceClaimStatuses`
+   populated for template-based claims, which does not exist during simulation.
+
+`DRAChecker` wraps the existing `NodeFeasibilityChecker` interface:
+
+1. Runs the inner checker first to get resource-feasible nodes
+2. For pods with `ResourceClaims`, builds synthetic `ResourceClaim` objects from
+   the pod template's `ResourceClaimTemplateName` or `ResourceClaimName`
+3. Lists `ResourceSlices` (device inventory) and allocated `ResourceClaims` from
+   the API to build the `AllocatedState`
+4. Runs `Allocate()` per node. Nodes where allocation returns nil are excluded.
+
+`DRAChecker` configures `structured.Allocator` using Kubernetes feature gates so the
+allocator matches the same devices the real kube-scheduler would. These are separate
+from Kueue DRA feature gates which control quota accounting:
+
+| Kubernetes gate (allocator behavior) | Status | Kueue gate (quota) |
+|--------------------------------------|--------|--------------------|
+| `DRAAdminAccess` | GA 1.36 | none |
+| `DRAConsumableCapacity` | Beta 1.36 | `KueueDRAIntegrationConsumableCapacity` |
+| `DRADeviceTaints` | Beta 1.36 | none |
+| `DRAListTypeAttributes` | Alpha 1.36 | none |
+| `DRAPartitionableDevices` | Beta 1.36 | `KueueDRAIntegrationPartitionableDevices` |
+| `DRAPrioritizedList` | GA 1.36 | none |
+
+`DeviceBindingAndStatus` is not set because it only affects allocation result
+status, not feasibility.
+
+**Limitations (Alpha):**
+- ResourceSlices, DeviceClasses, and allocated ResourceClaims are fetched per
+  scheduling cycle with no caching
+- No per-node device capacity counting is surfaced; feasibility filtering only
+- Extended resource workloads are not checked because they do not carry
+  `ResourceClaims`
+
 ### Architecture Details
 
 #### Queue Manager Extensions
@@ -1891,6 +1945,20 @@ tracks adding this). This follows the same pattern as upstream K8s integration t
   source drivers are added to the watched driver set at startup
 - integration and e2e tests
 
+##### KueueDRADeviceFeasibility (v0.20)
+
+- Feature gate: Alpha, default disabled
+- Requires `SchedulerLibraryIntegration` to be enabled
+- Uses `structured.Allocator` from `k8s.io/dynamic-resource-allocation/structured`
+  for per-node device feasibility
+- Configures the allocator with Kubernetes DRA feature gates
+  (`DRAPartitionableDevices`, `DRAConsumableCapacity`, `DRADeviceTaints`,
+  `DRAAdminAccess`, `DRAPrioritizedList`, `DRAListTypeAttributes`)
+- Limitation: ResourceSlices, DeviceClasses, and allocated ResourceClaims fetched
+  per scheduling cycle with no caching
+- Limitation: extended resource workloads not checked (no `ResourceClaims`)
+- unit tests
+
 #### Beta
 
 ##### KueueDRAIntegration (v0.18)
@@ -1934,6 +2002,14 @@ tracks adding this). This follows the same pattern as upstream K8s integration t
 - re-evaluate caching `deviceSelector` and `RequestPolicy` evaluation results
 - re-evaluate surfacing the rounded charge vs raw request in a workload condition or
   event for operator visibility
+
+##### KueueDRADeviceFeasibility
+
+- feature gate enabled by default
+- cache ResourceSlices and DeviceClasses across scheduling cycles instead of fetching
+  per cycle
+- surface per-node device capacity counts (not just feasibility filtering)
+- integration and e2e tests
 
 #### GA
 
@@ -1985,6 +2061,7 @@ tracks adding this). This follows the same pattern as upstream K8s integration t
 - Consumable capacity design: July 2026 by @sohankunkerkar — added KEP-5075 integration
   for software-level device sharing
 - Promoted KueueDRAIntegrationPartitionableDevices to Beta: July 2026 by @PannagaRao
+- DRA device feasibility via structured.Allocator: August 2026 by @sohankunkerkar
 
 **Key Design Evolution:**
 - **Original Design**: Standalone DynamicResourceAllocationConfig CRD with runtime ambiguity resolution

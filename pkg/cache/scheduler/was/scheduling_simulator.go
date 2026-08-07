@@ -49,9 +49,23 @@ type podNodeInfo struct {
 	podUID   types.UID
 }
 
+// WASOption configures the WAS simulator.
+type WASOption func(*wasSimulator)
+
+// WithDRA enables DRA device feasibility checking using the structured allocator.
+// The client should be the controller-runtime cached client (mgr.GetClient()).
+func WithDRA(cl client.Client) WASOption {
+	return func(s *wasSimulator) {
+		s.draEnabled = true
+		s.cl = cl
+	}
+}
+
 type wasSimulator struct {
 	newSnapshot snapshotFactory
 	pods        podTracker
+	draEnabled  bool
+	cl          client.Client
 }
 
 func newWASSchedulerConfig() *schedulerconfig.KubeSchedulerConfiguration {
@@ -92,7 +106,7 @@ func newWASSchedulerConfig() *schedulerconfig.KubeSchedulerConfiguration {
 	}
 }
 
-func newWASSimulator(ctx context.Context, client kubernetes.Interface) (simulator.SchedulingSimulator, error) {
+func newWASSimulator(ctx context.Context, client kubernetes.Interface, opts ...WASOption) (simulator.SchedulingSimulator, error) {
 	cfg := newWASSchedulerConfig()
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 
@@ -113,13 +127,17 @@ func newWASSimulator(ctx context.Context, client kubernetes.Interface) (simulato
 		return schedLibSnapshot.New(snap, profiles), nil
 	}
 
-	return &wasSimulator{
+	s := &wasSimulator{
 		newSnapshot: snapshotFn,
 		pods: podTracker{
 			podsByNode: make(map[string]map[types.UID]*corev1.Pod),
 			podIndex:   make(map[types.NamespacedName]podNodeInfo),
 		},
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // NewWASSimulatorForTest creates a WAS simulator backed by a fake client,
@@ -128,13 +146,11 @@ func NewWASSimulatorForTest(ctx context.Context) (simulator.SchedulingSimulator,
 	return newWASSimulator(ctx, fake.NewSimpleClientset())
 }
 
-func NewWASSimulator(ctx context.Context, restConfig *rest.Config) (simulator.SchedulingSimulator, error) {
-	// TODO(#13534): when DRA plugins are added, use a real client here
-	// instead of the fake so the informer factory is populated.
+func NewWASSimulator(ctx context.Context, restConfig *rest.Config, opts ...WASOption) (simulator.SchedulingSimulator, error) {
 	if _, err := schedLibSimulator.NewReadonlyClient(restConfig); err != nil {
 		return nil, err
 	}
-	return newWASSimulator(ctx, fake.NewSimpleClientset())
+	return newWASSimulator(ctx, fake.NewSimpleClientset(), opts...)
 }
 
 func (s *wasSimulator) NewFeasibilityChecker(ctx context.Context, nodes []*corev1.Node) (simulator.NodeFeasibilityChecker, error) {
@@ -143,7 +159,11 @@ func (s *wasSimulator) NewFeasibilityChecker(ctx context.Context, nodes []*corev
 	if err != nil {
 		return nil, err
 	}
-	return &wasChecker{snap: clusterSnap}, nil
+	checker := simulator.NodeFeasibilityChecker(&wasChecker{snap: clusterSnap})
+	if s.draEnabled {
+		checker = simulator.NewDRAChecker(checker, s.cl)
+	}
+	return checker, nil
 }
 
 func (s *wasSimulator) TrackPod(pod *corev1.Pod) {
