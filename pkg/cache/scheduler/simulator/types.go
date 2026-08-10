@@ -60,6 +60,10 @@ type PodRequirements struct {
 	// Used for SchedulerLibraryIntegration to compose the requirements in
 	// the form of `corev1.Pod`, which is accepted by the `scheduler-library`.
 	PodTemplate *corev1.PodTemplateSpec
+
+	// Namespace of the workload. Needed by DRAChecker to resolve
+	// ResourceClaimTemplates which are namespaced resources.
+	Namespace string
 }
 
 type NodeExclusionType int

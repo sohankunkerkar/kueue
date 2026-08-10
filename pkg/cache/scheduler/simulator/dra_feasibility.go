@@ -55,19 +55,36 @@ func (c *DRAChecker) FindFeasibleNodes(
 		return feasible, nil
 	}
 
-	logger := log.FromContext(ctx)
-
-	claims, err := buildSyntheticClaims(ctx, c.cl, requirements.PodTemplate)
+	allocator, claims, err := c.buildAllocator(ctx, requirements)
 	if err != nil {
-		return nil, fmt.Errorf("building synthetic DRA claims: %w", err)
+		return nil, err
 	}
 	if len(claims) == 0 {
 		return feasible, nil
 	}
 
+	return c.filterByDevices(ctx, feasible, allocator, claims, stats)
+}
+
+func (c *DRAChecker) buildAllocator(ctx context.Context, requirements *PodRequirements) (structured.Allocator, []*resourceapi.ResourceClaim, error) {
+	// In production, Namespace is set from the Workload's namespace via
+	// PodRequirements. The PodTemplate fallback covers unit tests where
+	// PodTemplate.ObjectMeta.Namespace is set directly.
+	ns := requirements.Namespace
+	if ns == "" {
+		ns = requirements.PodTemplate.Namespace
+	}
+	claims, err := buildSyntheticClaims(ctx, c.cl, ns, requirements.PodTemplate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("building synthetic DRA claims: %w", err)
+	}
+	if len(claims) == 0 {
+		return nil, nil, nil
+	}
+
 	var sliceList resourceapi.ResourceSliceList
 	if err := c.cl.List(ctx, &sliceList); err != nil {
-		return nil, fmt.Errorf("listing ResourceSlices: %w", err)
+		return nil, nil, fmt.Errorf("listing ResourceSlices: %w", err)
 	}
 	slices := make([]*resourceapi.ResourceSlice, len(sliceList.Items))
 	for i := range sliceList.Items {
@@ -76,17 +93,25 @@ func (c *DRAChecker) FindFeasibleNodes(
 
 	allocatedState, err := buildAllocatedState(ctx, c.cl)
 	if err != nil {
-		return nil, fmt.Errorf("building allocated device state: %w", err)
+		return nil, nil, fmt.Errorf("building allocated device state: %w", err)
 	}
 
-	ft := draFeatures()
 	classLister := &clientDeviceClassLister{cl: c.cl, ctx: ctx}
-
-	allocator, err := structured.NewAllocator(ctx, ft, allocatedState, classLister, slices, c.celCache)
+	allocator, err := structured.NewAllocator(ctx, draFeatures(), allocatedState, classLister, slices, c.celCache)
 	if err != nil {
-		return nil, fmt.Errorf("creating DRA allocator: %w", err)
+		return nil, nil, fmt.Errorf("creating DRA allocator: %w", err)
 	}
+	return allocator, claims, nil
+}
 
+func (c *DRAChecker) filterByDevices(
+	ctx context.Context,
+	feasible []MatchedCandidate,
+	allocator structured.Allocator,
+	claims []*resourceapi.ResourceClaim,
+	stats *NodeExclusionStats,
+) ([]MatchedCandidate, error) {
+	logger := log.FromContext(ctx)
 	var draFeasible []MatchedCandidate
 	for _, candidate := range feasible {
 		node := candidate.GetNode()
@@ -130,10 +155,10 @@ func hasDRAClaims(podTemplate *corev1.PodTemplateSpec) bool {
 	return len(podTemplate.Spec.ResourceClaims) > 0
 }
 
-func buildSyntheticClaims(ctx context.Context, cl client.Client, podTemplate *corev1.PodTemplateSpec) ([]*resourceapi.ResourceClaim, error) {
+func buildSyntheticClaims(ctx context.Context, cl client.Client, namespace string, podTemplate *corev1.PodTemplateSpec) ([]*resourceapi.ResourceClaim, error) {
 	var claims []*resourceapi.ResourceClaim
 	for _, prc := range podTemplate.Spec.ResourceClaims {
-		spec, err := resolveClaimSpec(ctx, cl, podTemplate.Namespace, prc)
+		spec, err := resolveClaimSpec(ctx, cl, namespace, prc)
 		if err != nil {
 			return nil, fmt.Errorf("resolving claim %q: %w", prc.Name, err)
 		}
@@ -143,7 +168,7 @@ func buildSyntheticClaims(ctx context.Context, cl client.Client, podTemplate *co
 		claims = append(claims, &resourceapi.ResourceClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("kueue-sim-%s", prc.Name),
-				Namespace: podTemplate.Namespace,
+				Namespace: namespace,
 			},
 			Spec: *spec,
 		})
