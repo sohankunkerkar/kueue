@@ -634,7 +634,7 @@ func newTASExclusionStats() *tasExclusionStats {
 }
 
 func (s *tasExclusionStats) hasExclusions() bool {
-	return s.NodeSelector > 0 || s.Affinity > 0 || len(s.Taints) > 0 || s.TopologyDomain > 0 || len(s.Resources) > 0
+	return s.NodeSelector > 0 || s.Affinity > 0 || len(s.Taints) > 0 || s.TopologyDomain > 0 || len(s.Resources) > 0 || s.DRANoFit > 0
 }
 
 func (s *tasExclusionStats) formatReasons() string {
@@ -650,6 +650,9 @@ func (s *tasExclusionStats) formatReasons() string {
 	}
 	if s.SchedulerLibraryNoFit > 0 {
 		reasons = append(reasons, fmt.Sprintf("schedulerLibraryNoFit: %d", s.SchedulerLibraryNoFit))
+	}
+	if s.DRANoFit > 0 {
+		reasons = append(reasons, fmt.Sprintf("draNoFit: %d", s.DRANoFit))
 	}
 	for _, taint := range slices.Sorted(maps.Keys(s.Taints)) {
 		reasons = append(reasons, fmt.Sprintf("taint %q: %d", taint, s.Taints[taint]))
@@ -674,6 +677,7 @@ func (s *tasExclusionStats) add(other *tasExclusionStats) {
 	s.Affinity += other.Affinity
 	s.TopologyDomain += other.TopologyDomain
 	s.SchedulerLibraryNoFit += other.SchedulerLibraryNoFit
+	s.DRANoFit += other.DRANoFit
 	for k, v := range other.Taints {
 		if s.Taints == nil {
 			s.Taints = make(map[string]int)
@@ -1208,6 +1212,9 @@ func (s *TASFlavorSnapshot) findTopologyAssignment(
 	}
 
 	requirements.podRequirements.PodTemplate = workersTasPodSetRequests.PodSet.Template.DeepCopy()
+	if wl != nil {
+		requirements.podRequirements.Namespace = wl.Namespace
+	}
 
 	// phase 1 - determine the number of pods and slices which can fit in each topology domain
 	err := s.fillInCounts(ctx, requirements, state)

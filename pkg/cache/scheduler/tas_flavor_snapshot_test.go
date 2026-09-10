@@ -30,10 +30,15 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	crzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/cache/scheduler/simulator"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/util/tas"
@@ -2292,4 +2297,132 @@ func TestUpdateCountsToMinimumGenericLogsLeafSummary(t *testing.T) {
 			t.Errorf("Observed leaf domain fields mismatch (-want +got):\n%s", diff)
 		}
 	})
+}
+
+// A stat the DRA check writes stays invisible to the operator unless add carries it
+// and formatReasons prints it.
+func TestExclusionStatsCarryDRANoFit(t *testing.T) {
+	testCases := map[string]struct {
+		stats            tasExclusionStats
+		wantHas          bool
+		wantInReasons    string
+		wantNotInReasons string
+	}{
+		"draNoFit alone is enough to report exclusions": {
+			stats:         tasExclusionStats{NodeExclusionStats: simulator.NodeExclusionStats{DRANoFit: 3}},
+			wantHas:       true,
+			wantInReasons: "draNoFit: 3",
+		},
+		"draNoFit is named separately from schedulerLibraryNoFit": {
+			stats: tasExclusionStats{NodeExclusionStats: simulator.NodeExclusionStats{
+				DRANoFit:              2,
+				SchedulerLibraryNoFit: 5,
+			}},
+			wantHas:       true,
+			wantInReasons: "draNoFit: 2",
+		},
+		"no exclusions when nothing was counted": {
+			stats:            tasExclusionStats{},
+			wantHas:          false,
+			wantNotInReasons: "draNoFit",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.stats.hasExclusions(); got != tc.wantHas {
+				t.Errorf("hasExclusions() = %v, want %v", got, tc.wantHas)
+			}
+			reasons := tc.stats.formatReasons()
+			if tc.wantInReasons != "" && !strings.Contains(reasons, tc.wantInReasons) {
+				t.Errorf("formatReasons() = %q, want it to contain %q", reasons, tc.wantInReasons)
+			}
+			if tc.wantNotInReasons != "" && strings.Contains(reasons, tc.wantNotInReasons) {
+				t.Errorf("formatReasons() = %q, want it not to contain %q", reasons, tc.wantNotInReasons)
+			}
+
+			// add must carry the field across the per-PodSet merge.
+			var dst tasExclusionStats
+			dst.add(&tc.stats)
+			if dst.DRANoFit != tc.stats.DRANoFit {
+				t.Errorf("add() carried DRANoFit = %d, want %d", dst.DRANoFit, tc.stats.DRANoFit)
+			}
+		})
+	}
+}
+
+// Drives the real entry point with the checker wired in. The checker's own tests use
+// a stub, so none of them shows a PodSet's claims actually reaching it.
+func TestFindTopologyAssignmentsFiltersNodesWithoutDevices(t *testing.T) {
+	const (
+		deviceClassName = "gpu.example.com"
+		namespace       = "default"
+	)
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("adding corev1 to scheme: %v", err)
+	}
+	if err := resourceapi.AddToScheme(scheme); err != nil {
+		t.Fatalf("adding resourcev1 to scheme: %v", err)
+	}
+
+	// Only n2 publishes a device, and n1 sorts first, so an assignment landing on
+	// n2 can only be the result of the device filtering.
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(
+		utiltesting.MakeDeviceClass(deviceClassName).Obj(),
+		utiltesting.MakeResourceClaimTemplate("gpu-claim", namespace).
+			DeviceRequest("gpu", deviceClassName, 1).
+			Obj(),
+		utiltesting.MakeResourceSlice("n2-gpus", deviceClassName).
+			NodeName("n2").
+			Pool("n2-pool", 1, 1).
+			Device("gpu-0").
+			Obj(),
+	).Build()
+
+	hostNode := node.MakeNode("").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("4"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).Ready()
+	nodes := []*corev1.Node{
+		hostNode.Clone().Name("n1").Label(corev1.LabelHostname, "n1").Obj(),
+		hostNode.Clone().Name("n2").Label(corev1.LabelHostname, "n2").Obj(),
+	}
+
+	tree := newTopologyTree([]string{corev1.LabelHostname}, nodes, 0)
+	snapshot := newTASFlavorSnapshot(log, "tas-topology", tree, nil,
+		simulator.NewDRAChecker(newDefaultSimulatorSnapshot(), cl))
+
+	unconstrained := true
+	requests := FlavorTASRequests{{
+		PodSet: &kueue.PodSet{
+			Name:            "main",
+			TopologyRequest: &kueue.PodSetTopologyRequest{Unconstrained: &unconstrained},
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ResourceClaims: []corev1.PodResourceClaim{
+						{Name: "gpu", ResourceClaimTemplateName: new("gpu-claim")},
+					},
+				},
+			},
+		},
+		SinglePodRequests: resources.NewRequestsFromMap(map[corev1.ResourceName]int64{corev1.ResourceCPU: 1000}),
+		Count:             1,
+	}}
+
+	// Every production caller passes WithWorkload, and that is where the
+	// namespace used to resolve the claim templates comes from.
+	wl := &kueue.Workload{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "wl"}}
+	result := snapshot.FindTopologyAssignmentsForFlavor(ctx, requests, WithWorkload(wl))
+	if failure := result.Failure(); failure != nil {
+		t.Fatalf("FindTopologyAssignmentsForFlavor() = %v, want the Pod to fit on n2", failure)
+	}
+	got := result["main"].TopologyAssignment
+	want := []string{"n2"}
+	if diff := cmp.Diff(want, got.Domains[0].Values); diff != "" {
+		t.Errorf("unexpected assignment (-want,+got): %s", diff)
+	}
 }

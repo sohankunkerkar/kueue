@@ -47,6 +47,11 @@ type NodeExclusionStats struct {
 	// Temporary non-granular reason for SchedulerLibraryIntegration, equivalent to the total number of not matching nodes.
 	// TODO(#13283): Long term the granular information should be taken in a structured form from the `scheduler-library`.
 	SchedulerLibraryNoFit int
+
+	// DRANoFit counts nodes that cannot satisfy the Pod's ResourceClaims. The device
+	// check does not go through the scheduler-library and runs against the default
+	// simulator too, so folding it into SchedulerLibraryNoFit would misreport it.
+	DRANoFit int
 }
 
 // PodRequirements stores pod-driven scheduling filters and
@@ -60,6 +65,10 @@ type PodRequirements struct {
 	// Used for SchedulerLibraryIntegration to compose the requirements in
 	// the form of `corev1.Pod`, which is accepted by the `scheduler-library`.
 	PodTemplate *corev1.PodTemplateSpec
+
+	// Namespace of the workload. Needed by DRAChecker to resolve
+	// ResourceClaimTemplates which are namespaced resources.
+	Namespace string
 }
 
 type NodeExclusionType int
