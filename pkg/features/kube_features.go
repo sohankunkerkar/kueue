@@ -544,6 +544,14 @@ const (
 	// Enable integration of the https://github.com/kubernetes-sigs/scheduler-library.
 	SchedulerLibraryIntegration featuregate.Feature = "SchedulerLibraryIntegration"
 
+	// owner: @sohankunkerkar
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2941-DRA
+	// issue: https://github.com/kubernetes-sigs/kueue/issues/10548
+	//
+	// Enable per-node DRA device feasibility checking before admission, so a Workload
+	// with ResourceClaims is not admitted when no node can satisfy them.
+	KueueDRADeviceFeasibility featuregate.Feature = "KueueDRADeviceFeasibility"
+
 	// owner: @j-skiba
 	//
 	// VectorizedResourceRequests enables slice-based indexing for resource requests in TAS snapshots,
@@ -714,6 +722,7 @@ var defaultFeatureGateDependencies = map[featuregate.Feature][]featuregate.Featu
 	SchedulingEquivalenceHashingIgnorePodSetName:    {SchedulingEquivalenceHashing},
 	MultiKueueReuseClientConnectionConfigForWorkers: {MultiKueue},
 	TASTopologySpreading:                            {TopologyAwareScheduling},
+	KueueDRADeviceFeasibility:                       {SchedulerLibraryIntegration},
 }
 
 // defaultVersionedFeatureGates consists of all known Kueue-specific feature keys.
@@ -995,6 +1004,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 
 	SchedulerLibraryIntegration: {
 		{Version: version.MustParse("0.19"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
+	KueueDRADeviceFeasibility: {
+		{Version: version.MustParse("0.20"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	VectorizedResourceRequests: {
