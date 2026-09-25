@@ -86,22 +86,13 @@ tags, and then generate with `hack/update-toc.sh`.
   - [<code>firstAvailable</code> Quota](#firstavailable-quota)
     - [Terminology](#terminology)
     - [How it works](#how-it-works)
-    - [Why the charge is exact](#why-the-charge-is-exact)
-    - [Alpha support matrix](#alpha-support-matrix)
-    - [Clearing a rejection](#clearing-a-rejection)
-    - [Where the static shapes are refused](#where-the-static-shapes-are-refused)
-    - [Exactness and composition](#exactness-and-composition)
+    - [What is rejected](#what-is-rejected)
     - [Interaction with other scheduling features](#interaction-with-other-scheduling-features)
-    - [Integration requirements](#integration-requirements)
-    - [Feature gate, version skew and MultiKueue](#feature-gate-version-skew-and-multikueue)
-    - [Relationship with Kubernetes ResourceQuota](#relationship-with-kubernetes-resourcequota)
+    - [Feature gate and version skew](#feature-gate-and-version-skew)
     - [Observability](#observability)
     - [Limitations](#limitations)
-      - [Alternatives with different counts are refused](#alternatives-with-different-counts-are-refused)
       - [The charge lands on one flavor](#the-charge-lands-on-one-flavor)
       - [A reservation is not bound to the claim that gets created](#a-reservation-is-not-bound-to-the-claim-that-gets-created)
-      - [Feasibility is checked, but it does not pick the alternative](#feasibility-is-checked-but-it-does-not-pick-the-alternative)
-      - [Selector compilation scales with the alternatives](#selector-compilation-scales-with-the-alternatives)
   - [Integration with Admission Fair Sharing](#integration-with-admission-fair-sharing)
   - [MultiKueue Integration](#multikueue-integration)
   - [Test Plan](#test-plan)
@@ -129,16 +120,14 @@ tags, and then generate with `hack/update-toc.sh`.
       - [KueueDRAIntegrationPrioritizedList](#kueuedraintegrationprioritizedlist)
     - [GA](#ga)
       - [KueueDRAIntegration](#kueuedraintegration)
-      - [KueueDRAIntegrationPrioritizedList](#kueuedraintegrationprioritizedlist-1)
       - [KueueDRAIntegrationExtendedResource](#kueuedraintegrationextendedresource-1)
       - [KueueDRAIntegrationPartitionableDevices](#kueuedraintegrationpartitionabledevices-1)
+      - [KueueDRAIntegrationPrioritizedList](#kueuedraintegrationprioritizedlist-1)
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
   - [Adding the dynamicresources Plugin to the Simulated Filters](#adding-the-dynamicresources-plugin-to-the-simulated-filters)
   - [Charging alternatives that differ in count](#charging-alternatives-that-differ-in-count)
-  - [Admitting one variant Workload per alternative through ConcurrentAdmission](#admitting-one-variant-workload-per-alternative-through-concurrentadmission)
-  - [Refusing a request whose mapped resource an excluded prefix covers](#refusing-a-request-whose-mapped-resource-an-excluded-prefix-covers)
   - [Webhook Rewriting Extended Resources to ResourceClaimTemplates](#webhook-rewriting-extended-resources-to-resourceclaimtemplates)
   - [ResourceClaim By Count](#resourceclaim-by-count)
   - [Using devices in ResourceSlice to Count](#using-devices-in-resourceslice-to-count)
@@ -278,18 +267,14 @@ a simple device class named `gpu.example.com`. This will be the way to enforce q
 - With `KueueDRADeviceFeasibility` and its dependencies enabled, Kueue does not reserve
   quota for a Workload whose devices no single node can supply, whether the Pod names a
   ResourceClaimTemplate or requests a DRA-backed extended resource.
-- Admins can enforce quota for `firstAvailable` requests over DeviceClass mappings with no
-  `sources`, charging the count every alternative of a request asks for, once, on their shared
-  logical resource.
+- Admins can enforce quota for `firstAvailable` requests whose alternatives all ask for the same
+  `count` on one logical resource.
 
 ### Non-Goals
 
-- Source-backed `firstAvailable` alternatives, those whose DeviceClass mapping carries a `counter`
-  or `capacity` source, are out of scope for the initial Alpha. Alternatives under a mapping with
-  no `sources`, called source-less below, are the scope.
-- The queue and status mechanisms that record a rejection and retire a stale queue entry belong
-  to `KueueDRAIntegration`. This KEP states the properties `firstAvailable` quota needs from them
-  and does not design them.
+- `firstAvailable` alternatives that differ in `count`, map to different logical resources, or
+  use a `counter` or `capacity` source. Kueue rejects them; the
+  [Beta criteria](#kueuedraintegrationprioritizedlist) say what supporting each one takes.
 - Quota accounting for DRADeviceTaints is not included: a tainted device is charged like
   any other. The per-node feasibility check honors taints instead, as
   [Device taints](#device-taints) describes.
@@ -324,10 +309,8 @@ scheduling. This includes:
    `capacity` source type on `deviceClassMappings` (requires Kubernetes
    `DRAConsumableCapacity` feature gate, beta in K8s 1.36). Kueue charges the workload's
    `capacity.requests` rounded per the device's `RequestPolicy`.
-8. Supporting device-count quota accounting for `firstAvailable` requests whose alternatives ask
-   for the same count on DeviceClasses mapped to the same logical resource, charged once, behind
-   `KueueDRAIntegrationPrioritizedList` (requires the Kubernetes `DRAPrioritizedList` gate, stable
-   in K8s 1.36).
+8. Supporting quota for `firstAvailable` requests whose alternatives ask for the same `count` on
+   one logical resource, behind `KueueDRAIntegrationPrioritizedList`.
 
 More details are documented in [Design Details](#design-details)
 
@@ -362,47 +345,40 @@ GPU memory quota, while a team requesting a 7g.80gb profile should consume 80Gi.
 
 #### Story 6
 
-As a user whose job needs one A100 per Pod and does not care how the card is exposed, I want a
-single claim that asks for a full card or else the whole-card MIG slice, so that my Pods run on
-the normal nodes and the nodes in MIG mode alike rather than waiting for one kind.
+As a user whose job needs one A100 per Pod and does not care how the card is exposed, I want one
+claim that asks for a full card or else the whole-card MIG slice, so my Pods run on normal nodes
+and on nodes in MIG mode alike.
 
-On a normal node the driver publishes an A100 as one full device; on a node in MIG mode it
-publishes the same card as one whole-card slice (`7g.80gb`), under another DeviceClass. The
-administrator budgets the card once, whichever way it is exposed, by listing both DeviceClasses
-under one logical resource, and keeps both kinds of node behind one flavor:
+On a normal node the driver publishes the A100 as a full device. On a node in MIG mode it
+publishes the same card as one whole-card slice (`7g.80gb`) under another DeviceClass. The
+administrator maps both DeviceClasses to one logical resource and covers both kinds of node with
+one flavor:
 
 ```yaml
-apiVersion: config.kueue.x-k8s.io/v1beta2
-kind: Configuration
+# Kueue Configuration
 resources:
   deviceClassMappings:
   - name: example.com/a100
-    deviceClassNames:
-    - a100.example.com
-    - a100-mig.example.com
+    deviceClassNames: [a100.example.com, a100-mig.example.com]
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
-  name: a100-nodes
+  name: a100
 spec:
   nodeLabels:
-    example.com/accelerator: a100
+    example.com/gpu-model: a100   # on normal nodes and on nodes in MIG mode
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
-  name: a100-queue
+  name: team-a
 spec:
   resourceGroups:
-  - coveredResources: ["cpu", "memory", "example.com/a100"]
+  - coveredResources: ["example.com/a100"]
     flavors:
-    - name: a100-nodes
+    - name: a100
       resources:
-      - name: cpu
-        nominalQuota: 64
-      - name: memory
-        nominalQuota: 512Gi
       - name: example.com/a100
         nominalQuota: 8
 ---
@@ -427,11 +403,14 @@ spec:
               expression: 'device.attributes["example.com"].profile == "7g.80gb"'
 ```
 
-A Job of four Pods naming the template under `resourceClaims` is charged 1 per Pod on
-`example.com/a100`, 4 in total, and is admitted while 4 of the 8 are free. kube-scheduler then
-takes, on the node it places each Pod on, the first alternative that node can satisfy: the full
-card on a normal node, the whole-card slice on a node in MIG mode. Either way the Pod uses one
-card, so the charge is what runs, whichever mix of nodes the Pods land on.
+A four-Pod Job using this template is charged 1 per Pod on `example.com/a100`, 4 in total. Each
+Pod gets a full card on a normal node or the whole-card slice on a node in MIG mode. Either way it
+uses one card, so the charge matches what runs, whatever mix of nodes the Pods land on.
+
+Adding a B300 alternative that the administrator budgets under its own logical resource would make
+the request span two logical resources, which Kueue rejects. If the administrator instead maps the
+B300 DeviceClass to `example.com/a100`, a B300 is charged as one `example.com/a100`, because the
+mapping, not the request, decides which devices share a budget.
 
 ### Notes/Constraints/Caveats (Optional)
 
@@ -499,14 +478,9 @@ See [Workload Rejection When DRA Is Disabled](#workload-rejection-when-dra-is-di
 
 With `firstAvailable`, Kueue reserves quota before kube-scheduler selects an alternative. The
 mitigation approach is documented here:
-1. Alpha admits only a request whose alternatives ask for the same count on one logical resource,
-   so the charge equals whichever alternative kube-scheduler allocates; alternatives with
-   different counts and source-backed alternatives are rejected. What that refuses is under
-   [Limitations](#limitations), and charging unequal alternatives is under
-   [Alternatives](#charging-alternatives-that-differ-in-count). A feasibility check, per node or
-   from the scheduler-library, refuses a reservation it cannot place but does not choose the
-   alternative; see [Feasibility is checked, but it does not pick the
-   alternative](#feasibility-is-checked-but-it-does-not-pick-the-alternative).
+1. Kueue admits only requests whose alternatives ask for the same `count` on one logical resource,
+   so the charge equals whichever alternative runs. Everything else is rejected; see
+   [What is rejected](#what-is-rejected).
 2. AdminAccess requests are skipped in quota counting. This feature can only be enabled in
    admin namespaces (gated by the `resource.kubernetes.io/admin-access` label), and provides
    shared read-only access to already-allocated devices. Charging quota would double-count the
@@ -570,10 +544,9 @@ Feature gates controlling DRA support in Kueue:
   `deviceClassMappings` entries. Requires `KueueDRAIntegration`. Also requires the
   Kubernetes `DRAConsumableCapacity` feature gate (beta in K8s 1.36).
 - `KueueDRAIntegrationPrioritizedList` (Alpha, default off): gates quota accounting for
-  `firstAvailable` requests whose alternatives ask for the same count on their shared logical
-  resource, charged once. Requires `KueueDRAIntegration`. Also requires the Kubernetes
-  `DRAPrioritizedList` feature gate (GA in K8s 1.36). Alternatives with different counts and
-  source-backed alternatives are rejected.
+  `firstAvailable` requests whose alternatives ask for the same `count` on one logical resource.
+  Requires `KueueDRAIntegration`. Also requires the Kubernetes `DRAPrioritizedList` feature gate
+  (on by default since K8s 1.34). Other `firstAvailable` requests are rejected.
 - `KueueDRARejectWorkloadsWhenDRADisabled` (Beta, default on since v0.18): rejects workloads
   that use DRA resources (ResourceClaimTemplates or ResourceClaims) when `KueueDRAIntegration`
   is disabled. Without this gate, DRA workloads submitted while `KueueDRAIntegration` is off
@@ -1208,8 +1181,8 @@ Counter-based resources fit into Kueue's existing (Flavor, Resource) quota model
 Borrowing, lending, cohorts, preemption, and fair sharing work with counter resources.
 The `deviceSelector` ensures accurate charging by narrowing the accounting
 domain. See [Processing Flow](#processing-flow-1) for details. A `firstAvailable` alternative
-whose DeviceClass mapping configures a counter source is rejected, since the counter path reads
-`Exactly` requests only.
+whose DeviceClass mapping configures a counter source is rejected; see
+[What is rejected](#what-is-rejected).
 
 #### ResourceSlice Structure
 
@@ -1612,11 +1585,8 @@ Kueue tracks consumed capacity dimensions such as GPU memory and compute cores f
 device's `Capacity` field and the workload's `capacity.requests` on `ExactDeviceRequest`.
 
 Only `ExactDeviceRequest` with `count` is supported. A `firstAvailable` alternative whose
-DeviceClass mapping configures a capacity source is rejected, consistent with the existing exclusion
-for partitionable devices. The exclusion is on the mapping, not on the field: a subrequest
-`capacity` requirement under a source-less mapping is charged by device count, as an `Exactly`
-request with the same requirement is today; [How it works](#how-it-works) under `firstAvailable`
-Quota says why.
+DeviceClass mapping configures a capacity source is rejected; see
+[What is rejected](#what-is-rejected).
 
 #### ResourceSlice Structure
 
@@ -2000,11 +1970,8 @@ scheduling pass only; the second pass, once quota is reserved, runs the check as
   receives: a PodSet needing more devices than a node has can still be placed there, and
   the surplus Pods stay Pending. Unlike the other gaps here this one over-admits rather
   than staying restrictive. Counts are Beta work
-- with `KueueDRAIntegrationPrioritizedList` on, a `firstAvailable` request is evaluated rather
-  than refused: the claim spec reaches the allocator unchanged and it walks the alternatives in
-  order, as kube-scheduler does. Only the verdict is kept, not the alternative; see
-  [Feasibility is checked, but it does not pick the
-  alternative](#feasibility-is-checked-but-it-does-not-pick-the-alternative)
+- with `KueueDRAIntegrationPrioritizedList` on, a node is feasible for a `firstAvailable`
+  request when any alternative fits on it; the check does not pick the alternative
 - the per-node allocation attempt is not bounded. kube-scheduler gives its own attempt a
   deadline and treats a timeout as retryable; here a slow DeviceClass selector stretches
   the scheduling cycle instead
@@ -2076,420 +2043,123 @@ This architecture separates concerns between DRA processing (controller) and que
 
 ### `firstAvailable` Quota
 
-This section is gated behind the `KueueDRAIntegrationPrioritizedList` Kueue feature gate (Alpha,
-default off). It adds quota accounting for `firstAvailable` requests; the Kubernetes API behind
-them, KEP-4816, is summarized in the
-[Appendix](#kep-4816-prioritized-alternatives-in-device-requests). With the gate off, such
-requests stay rejected as they are today. It adds no configuration field and no API field; the
-feature gate is the only new surface, and every input it reads, `deviceClassMappings` and the
-claim template itself, already exists.
+Kubernetes locks `firstAvailable` on from 1.37, while Kueue rejects every `firstAvailable` request
+today. Kubernetes has not settled how quota and `firstAvailable` fit together
+([kubernetes/kubernetes#141510](https://github.com/kubernetes/kubernetes/issues/141510)), so this
+feature covers only the requests Kueue can charge exactly.
 
-The gate decides one thing: whether a `firstAvailable` request may enter accounting or is refused
-as unsupported. Toggling it changes nothing observable for a Workload with no `firstAvailable`
-request. The queue and status mechanisms that record a rejection and retire a stale queue entry
-are `KueueDRAIntegration` properties, listed as parent prerequisites with the
-[Alpha criteria](#kueuedraintegrationprioritizedlist-v020) and designed with the parent path.
+`KueueDRAIntegrationPrioritizedList` (Alpha, off by default) lets Kueue charge quota for a
+`firstAvailable` request whose alternatives all ask for the same `count` on one logical resource.
+Every other `firstAvailable` request stays rejected. The feature is experimental and not meant
+for production use. The Kubernetes API is summarized in the
+[Appendix](#kep-4816-prioritized-alternatives-in-device-requests).
 
 #### Terminology
 
-- **`firstAvailable` request**: a `.spec.devices.requests[*]` entry of a ResourceClaimTemplate
-  (under `.spec.spec` there) whose `firstAvailable` list is set.
-- **Alternative**: one `.spec.devices.requests[*].firstAvailable[*]` entry in that list.
-- **Logical resource**: the `name` of a `deviceClassMappings` entry, the resource name a
-  ClusterQueue's quota is written in, charged by every DeviceClass listed under it;
-  `example.com/a100` in the example below. See
-  [Configuration API Extension for DRA](#configuration-api-extension-for-dra).
-- **Charge**: the quota a request costs on a logical resource, after `deviceClassMappings` maps its
-  DeviceClass. For a `firstAvailable` request it is the count every alternative asks for, charged
-  once.
-- **Source-less mapping**: a `deviceClassMappings` entry with no `sources`, charged by device
-  count. Source-backed mappings are supported elsewhere in this KEP; source-backed
-  *alternatives* are what this gate's Alpha leaves out.
+- **Alternative**: one `.spec.devices.requests[*].firstAvailable[*]` entry of a
+  ResourceClaimTemplate.
+- **Logical resource**: the `name` of a `deviceClassMappings` entry, which is the resource a
+  ClusterQueue sets quota for, such as `example.com/a100` in [Story 6](#story-6).
+- **Source-less mapping**: a `deviceClassMappings` entry without `sources`, charged by device
+  count.
 
 #### How it works
 
-1. For each top-level `firstAvailable` request, resolve every alternative's DeviceClass through
-   `deviceClassMappings`. Reject the request unless every alternative is an `ExactCount` request
-   under a source-less mapping, all of them resolve to the same logical resource, and all of them
-   ask for the same count.
-2. Read each alternative's `count` (`.spec.devices.requests[*].firstAvailable[*].count`) as the
-   ResourceClaimTemplate stores it.
-3. Charge that count once on that logical resource.
-4. Add the charges of independent requests to the existing `Exactly` charges, then scale by the
-   effective PodSet count.
+When every alternative costs the same, Kueue charges that cost once. A `firstAvailable` request is
+charged when all of these hold:
 
-PodSet scaling is unchanged, and with `ElasticJobsViaWorkloadSlices` each slice carries its own
-count and computes its charge independently.
+1. every alternative uses `allocationMode: ExactCount`;
+2. every alternative's DeviceClass has a source-less mapping to the same logical resource;
+3. every alternative asks for the same `count`.
 
-| Alternative | Request | DeviceClass | Maps to | Charge |
-|---|---|---|---|---|
-| 1st choice | 1 device | `a100.example.com` | `example.com/a100` | 1 |
-| fallback | 1 device | `a100-mig.example.com` | `example.com/a100` | 1 |
-| **charged** | | | | **1** |
+The request is then charged that `count` on that logical resource, as an `exactly` request with
+that `count` is. Whichever alternative kube-scheduler allocates, the Pod uses what was charged.
+A `capacity` requirement on an alternative does not change the charge, because a source-less
+mapping charges by device count.
 
-A second, independent request for one device of the same resource brings the per-Pod charge to 2,
-before PodSet scaling.
+For [Story 6](#story-6):
 
-**Whichever alternative kube-scheduler picks, the Pod uses one device, so the Workload consumes
-what it holds.** A request whose alternatives differ in count, one H100 or else two A100s, has no
-charge that is right before the choice is made, so it is refused; charging it anyway is under
-[Alternatives](#charging-alternatives-that-differ-in-count), and lifting the limit is a
-[Beta criterion](#kueuedraintegrationprioritizedlist).
+| Alternative | DeviceClass | Logical resource | `count` |
+|---|---|---|---|
+| `full` | `a100.example.com` | `example.com/a100` | 1 |
+| `slice` | `a100-mig.example.com` | `example.com/a100` | 1 |
+| **Charge per Pod** | | `example.com/a100` | **1** |
 
-What does not change the charge:
+#### What is rejected
 
-- A subrequest `capacity` requirement sets how much of each device the claim takes, not how many
-  devices the alternative asks for. Under a source-less mapping the device is the unit, so the
-  count is the charge, as it already is for an `Exactly` request carrying the same requirement,
-  and an omitted `capacity`, which is not the absence of consumption, is charged that count too.
-- Refusing it there would turn away a request that is admitted as `exactly` as soon as it is
-  written as a one-alternative `firstAvailable`, over a field that changes nothing a source-less
-  mapping meters. Where `capacity` does meter, on a capacity source, the alternative is refused,
-  since that path reads `Exactly` alone.
-
-#### Why the charge is exact
-
-kube-scheduler selects exactly one alternative per request, and every alternative asks for the
-same count on the same logical resource, so the selected alternative costs exactly the charge, and
-summed over requests the realized charge equals the admitted one.
-
-This holds when:
-
-- every alternative resolves to a supported, non-negative count on its logical resource, the same
-  for all of them, which is why unmapped, unsupported and unknown forms are refused rather than
-  charged, and so are alternatives whose counts differ;
-- every other contribution to a charged resource arrives at the merge exactly once, non-negative,
-  and as the value its own source defines.
-
-The classifier sees only the request forms in the Kubernetes API version Kueue is compiled
-against, so bumping that dependency means reviewing any new field that affects the charge.
-
-#### Alpha support matrix
-
-| Request | Alpha |
-| --- | --- |
-| `ResourceClaimTemplate` reference | supported |
-| `ExactCount` alternatives | supported, charged by `count` |
-| alternatives under source-less mappings (no `sources`) that all resolve to one logical resource and all ask for the same `count` | supported, that count charged once |
-| subrequest `capacity` under a source-less mapping | supported, charged by device count; `capacity` sets how much of each device the claim takes, not how many, and [How it works](#how-it-works) says why that is charged rather than refused |
-| subrequest `selectors` and `tolerations` | selectors compiled; neither is part of the charge; no device cardinality check |
-| direct `ResourceClaim` reference | rejected |
-| an alternative with allocation mode `All` | rejected |
-| unknown allocation mode, or a malformed union | rejected |
-| an alternative with an unmapped DeviceClass | rejected |
-| an alternative whose mapping configures a `counter` or `capacity` source | rejected |
-| alternatives resolving to more than one logical resource | rejected |
-| alternatives whose counts differ | rejected |
-| a source-backed `Exactly` request in the same Workload, unless `adminAccess` | rejected |
-| a non-DRA contribution on a resource a `firstAvailable` request is charged on | rejected |
-
-Every rejected row has the same outcome, an inadmissible Workload, recorded as
-[Clearing a rejection](#clearing-a-rejection) describes; the rows differ only in what the message
-names. Inadmissible here is what the `Exactly` path does today: the workload reconciler records
-the conditions [Clearing a rejection](#clearing-a-rejection) lists and does not hand the Workload
-to the queue manager, and the event handlers skip a Workload that still needs DRA preprocessing.
-The Workload is not deactivated and never enters a ClusterQueue, its heap or its inadmissible
-set, so it holds no head and starves nothing; how it comes back is under
-[Clearing a rejection](#clearing-a-rejection).
-
-Why each refusal exists:
-
-- **Any unsupported alternative refuses the whole request.** kube-scheduler may still choose the
-  alternative Kueue dropped, and then the Workload consumes what was never charged.
-- **Alternatives whose counts differ**: no single charge is right before the choice is made. The
-  smaller under-reserves when the larger runs; the larger is safe but is held for the life of the
-  Workload, which is what the equal-count rule avoids; and adjusting the reservation once the claim
-  is allocated needs a mechanism Alpha does not have. Beta takes the extension up; the charges
-  considered are under [Alternatives](#charging-alternatives-that-differ-in-count).
-- **Source-backed alternatives**: the counter and capacity paths process only `Exactly` today, so
-  an alternative there would go unmetered by its source, and its device count would not be a
-  charge in the counter's or the capacity's units. Extending the charge to these alternatives is
-  reconsidered in the [Beta criteria](#kueuedraintegrationprioritizedlist).
-- **More than one logical resource** would charge every dimension while kube-scheduler consumes
-  one, so a fallback would make admission strictly harder than no fallback. Beta must solve this
-  before the limit is lifted. The limit is on the mapping rather than on the request shape: the
-  same Workload becomes supported once the administrator maps those DeviceClasses to one resource.
-- **A source-backed `Exactly` request in the same Workload**: with the ResourceSlice API
-  unavailable, a counter or capacity source contributes zero today rather than failing closed, and
-  this gate stays clear of that shared defect rather than admitting a Workload whose other charges
-  may fall short. Beta lifts the limit once such a source fails closed.
-- **A non-DRA contribution on a charged resource** is refused rather than merged. An `Exactly`
-  charge is not one, since it is charged against the same total, and neither is a DRA-backed
-  extended resource, which is replaced before the merge reads it. Lifting this limit takes an
-  amendment here or Beta criteria naming the combinations that become supported; prerequisite
-  work merging does not lift it on its own.
-
-The shape Alpha covers is one device budget exposed more than one way. The plainest case, the
-one [Story 6](#story-6) shows, is a card that a normal node exposes as a full GPU and a node in
-MIG mode as a whole-card slice: two DeviceClasses under one logical resource, one device either
-way. Two generations of one accelerator, an H100 class or else an A100 class, fit the rule only
-where an administrator budgets them as one logical resource and serves them from flavors whose
-nodes carry both, which is the rarer setup, since the two are priced and supported apart; with a
-flavor per model the request is priced as
-[The charge lands on one flavor](#the-charge-lands-on-one-flavor) describes.
-A fallback across budgets, a GPU or else a TPU, is what the resource rule refuses, and a fallback
-across counts, one 80 GiB card or else two 40 GiB ones, is what the count rule refuses and Beta
-takes up.
-
-A missing DeviceClass is not a rejection on this path. The charge reads `deviceClassName`, the
-mapping and the declared count, never the DeviceClass object, so the class's existence and its
-selectors are left to kube-scheduler along with feasibility.
-
-#### Clearing a rejection
-
-What re-evaluates each rejection is the event that changes its cause, and an implementation that
-requeues on Workload updates alone waits for the wrong event:
-
-| Rejection | Cleared by |
-| --- | --- |
-| a direct `ResourceClaim` reference | a PodSet template change |
-| `All` in an alternative, alternatives whose counts differ, or an allocation mode this build does not know | a template change; `ResourceClaimTemplate.spec` is immutable, so a template repair is a delete and a recreate; an unknown mode also clears once Kueue is built against the API that defines it |
-| a malformed union | the apiserver rejects it at creation; Kueue fails closed if one arrives, and a template or PodSet change clears it |
-| the configuration around it: an unmapped DeviceClass, a `counter` or `capacity` source on an alternative's mapping, alternatives over more than one logical resource | a request or template change, or a manager restart with the changed mappings |
-| a container, init-container or Pod-level request on a charged resource, including a limit read as a missing request, or `spec.overhead` on the Pod template | a PodSet template update |
-| a `LimitRange` default on a charged resource | that `LimitRange` created, updated or deleted, or a template update that stops it applying |
-| RuntimeClass overhead on a charged resource | that RuntimeClass created, updated or deleted, or a `runtimeClassName` change |
-| a resource transformation output on a charged resource | a manager running with the changed configuration, or a change to the input it reads |
-| a source-backed `Exactly` request in the same Workload | the claim definition changing, or Kueue starting with a mapping that makes it source-less |
-| a template the request names that does not exist | that template being created, through a watch keyed by namespace and name, so a same-name template in another namespace wakes nothing |
-| a transient read or API error | not a verdict; retried |
-
-Every event in the second column is already delivered by a watch the workload controller has,
-except the template one, which needs an index from a Workload to the templates it references and a
-watch on their lifecycle. Every row also assumes a parked Workload is reconciled once its cause
-changes. The clearing itself exists: since
-[#15888](https://github.com/kubernetes-sigs/kueue/pull/15888), a Workload whose DRA resources
-resolve on a later reconcile is requeued with reason
-`DRAResourcesResolved`. What [#13969](https://github.com/kubernetes-sigs/kueue/issues/13969) still
-tracks is the wake-up, the event that reconciles a Workload repaired from outside it; it is listed
-with the [Alpha criteria](#kueuedraintegrationprioritizedlist-v020).
-
-A rejection is recorded the way the `Exactly` path records one today: `QuotaReserved=False` with
-reason `Misconfigured`, or `Inadmissible` where `UnadmittedWorkloadsObservability` is disabled, and
-`Requeued=False` with reason `Inadmissible`, so the reason does not distinguish the rows. The
-message does: it carries every refused field's path and detail, from the PodSet and
-`resourceClaims` index down to the alternative, and each row above maps to one detail string. A
-per-row reason would be a change to the parent path's condition schema and is not made here.
-
-#### Where the static shapes are refused
-
-The static shapes are refused by the workload reconciler, where the `Exactly` path refuses them
-today, rather than by the Workload webhook.
-
-- Three live in the template. `All` and alternatives with different counts are valid upstream,
-  and an unknown allocation mode is one a newer apiserver may accept while the API asks clients
-  to refuse it. The webhook does not read the
-  template, and a template can be deleted and recreated under the same name after the Workload has
-  passed the webhook, so a check there would be neither complete nor final.
-- A malformed union does not reach Kueue from a validated apiserver; the classifier's refusal is a
-  fail-closed default for an object that bypassed validation.
-- A direct `ResourceClaim` reference is visible in the Workload, so the webhook could refuse it.
-  The parent path parks such a Workload today, and refusing it earlier is a change both request
-  kinds would take together, which Beta re-evaluates.
-- A Workload is created by the job reconciler rather than by the user, so a webhook denial surfaces
-  as a create error the reconciler retries, while an inadmissible Workload carries the reason in a
-  condition.
-
-Who validates what:
-
-| Check | Where |
-| --- | --- |
-| The claim template's shape: the `exactly`/`firstAvailable` union, alternative names, list sizes, allocation modes, selector syntax | the Kubernetes API server, on the template; Kueue fails closed on a shape it does not know or an object that bypassed validation |
-| Which alternative is allocated, and on which node | kube-scheduler, at allocation time |
-| The gate's dependency on `KueueDRAIntegration` | Kueue configuration validation, at startup |
-| Every row of the support matrix | the Kueue workload reconciler, before the Workload is queued |
-| The composition refusal | the request builder, on the effective resources the DRA pass read |
-| Quota fit, borrowing and preemption on the charge | the Kueue scheduler |
-| Whether some alternative fits a node, with `KueueDRADeviceFeasibility` | the Kueue scheduler's per-node check |
-| A Kueue webhook or CEL rule | none; the Workload webhook does not read the template, and this feature adds no rule |
-
-#### Exactness and composition
-
-The charges of a claim's requests are summed exactly at any magnitude, and the sum becomes a
-whole-unit quantity the way the `Exactly` count does, so a logical resource named `cpu` is charged
-one core per device on both paths. From there a DRA charge is treated like any other request: the
-per-Workload request arithmetic saturates at the 64-bit limit, and a charge of that magnitude is
-admissible only against a quota of the same magnitude, since the scheduler compares amounts
-exactly. That saturation is shared behaviour
-([#14371](https://github.com/kubernetes-sigs/kueue/issues/14371)); this gate neither depends on it
-nor changes it.
-
-Each operand is checked non-negative where the merge happens. A negative request on a charged
-resource would subtract from the charge, and flooring the merged total at zero afterwards would
-hide the cancellation rather than prevent it. The `WorkloadValidateResourcesAreNonNegative` gate
-is not relied on for this, since an administrator can turn it off.
-
-Preprocessing carries the set of logical resource names the `firstAvailable` charges reached
-alongside the merged charge, and both survive the same requeue. The workload request builder
-reads the same effective resources the DRA pass read, before extended-resource replacement runs,
-refuses a Workload carrying a non-DRA contribution on any of those names anywhere in the
-Workload, and checks the merged value of what remains. The `Exactly` path merges such a
-contribution today and keeps doing so until a `firstAvailable` request reaches the name, an
-asymmetry that is deliberate: it keeps this gate clear of the shared accounting defects rather
-than making it their fix. Summing by resource name before flavors are assigned is stricter than
-the per-flavor accounting that follows, which is intended.
-
-How existing mechanisms interact with a resource a `firstAvailable` request is charged on:
-
-| Mechanism | Effect |
+| Request | Why |
 |---|---|
-| `excludeResourcePrefixes` | Applies to the Pod's own requests, before transformations. A logical resource an explicit `deviceClassMappings` entry synthesizes stays chargeable, as on the `Exactly` path. |
-| `transformations` | Run over the Pod's requests before the merge, so a logical resource named as an input or multiplier matches nothing, while outputs aimed at one reach it. |
-| `quotaCheckStrategy: IgnoreUndeclared` ([KEP-7513](../7513-quota-check-strategy/README.md)) | Filters the resource on the same terms as an `Exactly` charge or an ordinary request on that name, per request rather than per alternative. An administrator who wants DRA quota enforced declares the mapped resource or keeps `BlockUndeclared`. |
-| A non-DRA contribution on a charged resource: a container, init-container or Pod-level request, a `LimitRange` default, RuntimeClass overhead or a transformation output | The Workload is refused rather than merged, for any of those names anywhere in the Workload. An `Exactly` charge on the name is not such a contribution, and neither is a DRA-backed extended resource. |
+| alternatives whose `count` differs, such as one H100 or else two A100s | no single charge is right before kube-scheduler picks; see [Charging alternatives that differ in count](#charging-alternatives-that-differ-in-count) |
+| alternatives mapped to different logical resources, such as an A100 or else a B300 budgeted apart | charging every resource makes a fallback harder to admit than no fallback |
+| an alternative whose mapping has a `counter` or `capacity` source | those sources charge `exactly` requests only |
+| an unmapped DeviceClass, or an `allocationMode` other than `ExactCount` | no finite charge |
+| a direct ResourceClaim reference | rejected for `exactly` requests today |
 
-Whether an overlap between a prefix and a mapping should be refused at configuration load is a
-question for every mapping and is left to its own issue.
+One unsupported alternative rejects the whole request, because kube-scheduler could still pick it.
+
+A rejected Workload gets `{type: "Requeued", status: "False", reason: "Inadmissible"}` with a
+message naming the rejected field, and is pushed into neither the active nor the inadmissible queue.
+Once the cause is resolved, the Workload gets
+`{type: "Requeued", status: "True", reason: "DRAResourcesResolved"}` and moves to the scheduling
+flow. This is how an `exactly` request with unresolved DRA resources is handled today.
+
+Where each check runs:
+
+| Component | Checks |
+|---|---|
+| Kubernetes API server | the ResourceClaimTemplate shape: `exactly` or `firstAvailable`, list sizes, `allocationMode` values, selector syntax |
+| Kueue Workload webhook | none; it does not read ResourceClaimTemplates |
+| Kueue workload controller | every row of the table above, before the Workload is queued |
+| Kueue scheduler | quota for the charge, as for any other resource |
+| kube-scheduler | which alternative is allocated, and on which node |
 
 #### Interaction with other scheduling features
 
-The charge is merged into the Workload's total requests the way an `Exactly` charge is, and since
-it equals what runs, every consumer of that total sees real usage.
+Kueue stores the charge in the Workload's requests the same way it stores an `exactly` charge, so
+only features that read the claim or the Pod spec can tell the two apart.
 
-| Feature | Interaction |
-|---|---|
-| Preemption | As for an `Exactly` request: the victim set is sized from a charge that equals what the preemptor will use, and a victim frees what it used. |
-| Fair Sharing and Admission Fair Sharing | As for an `Exactly` request: usage, dominant-resource share and entry penalties reflect what each tenant runs. |
-| Cohort borrowing and lending | As for an `Exactly` request: borrowed amounts are what the Workload uses. |
-| Topology Aware Scheduling | Accounting is unaffected: the assigner builds a Pod's requests from the Pod spec, not from the admission totals, so a DRA charge cannot reach topology accounting. Placement is affected the way it is for an `Exactly` request: the per-node check in [DRA Device Feasibility](#dra-device-feasibility) answers whether one Pod could fit a node, not how many devices it takes, a gap that section already records. Every alternative asks for the same count, so which one a node satisfies changes nothing here. |
-| Admission-time feasibility via scheduler-library | Answers only whether *some* alternative is satisfiable ([#12422](https://github.com/kubernetes-sigs/kueue/issues/12422)), since what is handed to the simulator carries no claim fields and Kueue cannot bind which alternative is chosen. With equal counts that is all the charge needs; see [Feasibility is checked, but it does not pick the alternative](#feasibility-is-checked-but-it-does-not-pick-the-alternative). |
-| Cluster autoscaling and ProvisioningRequest | Kueue adds nothing about the alternatives: the ProvisioningRequest carries the PodSet template with the assigned flavor's node selector, so the claim and its alternatives reach the autoscaler as they reach kube-scheduler, and which alternative, and so which instance type, is the autoscaler's own DRA simulation to decide. The `managedResources` check reads container requests, which a DRA charge never enters. |
-| ConcurrentAdmission | One variant per flavor, never per alternative, and the ClusterQueue webhook caps that at sixteen flavors in one resource group, so the alternatives do not multiply variants and each variant carries the same charge; see [The charge lands on one flavor](#the-charge-lands-on-one-flavor). |
-| Partial admission and reclaimable Pods | Scale the PodSet count and leave the per-Pod charge alone, so the charge falls with the count and stays what the remaining Pods run. |
-| MultiKueue | Out of scope for Alpha; see [Feature gate, version skew and MultiKueue](#feature-gate-version-skew-and-multikueue). |
+| Feature | With `firstAvailable` | Why |
+|---|---|---|
+| Preemption, Fair Sharing, Admission Fair Sharing, cohort borrowing | Same as an `exactly` request with the same `count`. | The charge equals what the Pod uses, so nothing is over-accounted. |
+| Topology Aware Scheduling | Same as an `exactly` request. | TAS places Pods by the requests in the Pod spec, which do not include ResourceClaimTemplate devices; which nodes can supply the devices is decided by `KueueDRADeviceFeasibility`. |
+| ResourceFlavor | The charge lands on the one flavor the PodSet is assigned. | See [The charge lands on one flavor](#the-charge-lands-on-one-flavor). |
+| ConcurrentAdmission | One variant per flavor, never per alternative, each with the same charge. | Variants differ in flavors, not in claims; see [Alternatives](#charging-alternatives-that-differ-in-count). |
+| `KueueDRADeviceFeasibility` | A node is feasible when any alternative fits on it. | The check does not pick the alternative; kube-scheduler does, so Pods of one PodSet can use different alternatives. |
+| ProvisioningRequest | Unchanged. The ProvisioningRequest carries the PodSet's template with its claim, as for an `exactly` request. | The autoscaler, not Kueue, decides which alternative, and so which instance type, to provision for. |
+| Partial admission, reclaimable Pods, elastic Workload slices | Same as an `exactly` request. | They change the Pod count, not the charge per Pod. |
+| Resource transformations, `excludeResourcePrefixes`, `quotaCheckStrategy` ([KEP-7513](../7513-quota-check-strategy/README.md)) | Same as an `exactly` request. | The charge is a DRA charge like any other. |
+| MultiKueue | Not supported. | A worker charges the Workload again with its own feature gate, mappings and ResourceClaimTemplates, so a worker missing any of them keeps the remote Workload inadmissible. |
 
-#### Integration requirements
+#### Feature gate and version skew
 
-The quota path, the MultiKueue admission check and any admission-time feasibility path consume one
-static-support classifier, in two stages. The first reads the API shape alone, with no gate, no
-mapping and no cluster state; it names every form a Pod's `resourceClaims` entry and a device
-request can take, refuses the malformed ones, and fails closed on an unset kind. The second
-combines that kind with the gate and the mapping to reach a disposition. An infeasible result is
-never surfaced as unsupported, and a failed read is neither.
-
-Selectors in every alternative are compiled with the DRA CEL compiler and syntax-checked, through
-the DRA path's shared compile cache, which is keyed on the expression text and holds 256 entries, so
-a reconcile compiles only the expressions it has not seen. See [Selector compilation scales with the
-alternatives](#selector-compilation-scales-with-the-alternatives) for the cost. The `Exactly`
-device-cardinality check is not reused, since it would require every alternative to be satisfiable
-while only one has to be. Skipping it does not affect quota safety, only whether an unschedulable
-Workload can hold its reservation, which `WaitForPodsReady`, when enabled, eventually
-releases. A selector stored in the supported API version must compile in a DRA CEL environment
-compatible with the apiserver's, which is a shared DRA prerequisite
-([#14372](https://github.com/kubernetes-sigs/kueue/issues/14372)).
-
-A source-less mapping registers no driver with the ResourceSlice controller, so a Workload waiting
-on quota is re-evaluated on the next ClusterQueue event, and once quota is reserved kube-scheduler
-owns feasibility. The charge under a source-less mapping is a function of the claim spec and
-`deviceClassMappings` alone: it reads no ResourceSlices, so the charge cannot go stale from device
-changes, only from a spec or configuration change. The TAS+DRA work
-([#10548](https://github.com/kubernetes-sigs/kueue/issues/10548)) and the admission-time
-feasibility umbrella ([#12422](https://github.com/kubernetes-sigs/kueue/issues/12422)) inform
-accuracy and do not block this design.
-
-The parent DRA fixes and their regression coverage are tracked with the implementation in
-[#14130](https://github.com/kubernetes-sigs/kueue/pull/14130). This amendment does not select the
-queue, status or builder mechanisms that provide these guarantees; the properties it depends on
-are listed with the Alpha criteria.
-
-#### Feature gate, version skew and MultiKueue
-
-- `KueueDRAIntegrationPrioritizedList` requires `KueueDRAIntegration`; a configuration enabling it
-  without the parent is refused by configuration validation. It also needs a cluster whose API
-  serves `firstAvailable` (the upstream `DRAPrioritizedList` gate, see the
-  [Appendix](#kep-4816-prioritized-alternatives-in-device-requests)); where it does not, no
-  `firstAvailable` request is charged.
-- The Alpha is for evaluation outside production, and the user documentation says so, together
-  with the request shapes it refuses.
-- Disabling the gate returns a new `firstAvailable` Workload to the current rejection. A Workload
-  that has reserved quota keeps the accounting recorded in its status, since an admitted Workload
-  is rebuilt from `status.admission` rather than recomputed, so a restart does not lose the
-  charge. A binary downgrade to a version without this feature is not covered and wants such
-  Workloads released first.
-- MultiKueue is out of scope for the initial Alpha. A manager and a worker resolve
-  ResourceClaimTemplates against their own objects and could arrive at different charges, so the
-  MultiKueue admission check refuses a local Workload whose static classification finds a
-  `firstAvailable` request, before any remote Workload or Job is created and whether the gate is on
-  or off; a template that cannot be read yet stays retryable.
-
-#### Relationship with Kubernetes ResourceQuota
-
-This is a Kueue-specific policy and does not change Kubernetes `ResourceQuota`. The two count a
-`firstAvailable` request differently, as the
-[Appendix](#kep-4816-prioritized-alternatives-in-device-requests) sets out side by side.
-Namespace `ResourceQuota` and `ClusterQueue` quota may both apply to one Workload, and
-`firstAvailable` is not a way around either.
+- The feature needs `KueueDRAIntegration`, and a cluster serving `firstAvailable` (on by default
+  since Kubernetes 1.34).
+- With the gate turned off, new `firstAvailable` Workloads are rejected again. An admitted Workload
+  keeps its charge, which is recorded in `status.admission`.
+- Before downgrading Kueue to a version without this feature, release the `firstAvailable`
+  Workloads.
 
 #### Observability
 
-An admitted Workload records its charge in `status.admission` like any other, so existing
-ClusterQueue usage metrics already report it, and since the charge equals what runs there is no
-reserved-versus-realized gap to expose. That gap appears once alternatives may differ in count;
-whether to expose it then is a Beta question, tied to the post-allocation adjustment that would
-make it actionable.
+An admitted Workload records its charge in `status.admission`, so the existing ClusterQueue usage
+metrics include it. A rejected Workload is visible through the `Requeued` condition and its message.
 
 #### Limitations
 
-##### Alternatives with different counts are refused
-
-A claim asking for one 80 GiB card or else two 40 GiB ones is refused, not charged. No single
-count is right before kube-scheduler chooses, and adjusting the reservation afterwards needs a
-mechanism that observes the generated claims and updates admitted usage, cache, Fair Sharing,
-borrowing and preemption state, which Alpha does not have. Such a claim names one shape for now,
-or waits for Beta, which takes this extension up; the charges considered for it are under
-[Alternatives](#charging-alternatives-that-differ-in-count).
-
 ##### The charge lands on one flavor
 
-Flavor assignment gives a PodSet one flavor per resource group, so the charge lands on the
-flavor the assigner settles on, by default the first in the ClusterQueue's order that fits it,
-and the Pods carry that flavor's node labels. With the full-card class and the MIG class of
-[Story 6](#story-6) each behind its own flavor, only the alternative whose devices are on the
-assigned flavor's nodes can be allocated, so which alternative runs is settled by flavor
-assignment, from the flavor order and the quota left, before kube-scheduler sees a device. The
-charge is the same on either flavor, one per Pod, so nothing is over-reserved; what is lost is
-the fallback, which needs every alternative to have devices behind whichever flavor is assigned,
-flavors whose nodes carry both, as the Alpha story assumes. Flavors carrying two models are not
-the usual setup: a budget per model is kept as a flavor per model and a logical resource per
-model, and a fallback between them is refused by the resource rule before a flavor is
-considered. ConcurrentAdmission pursues the flavors in parallel rather than in order, which
-changes which flavor wins, not what it is charged.
-Beta takes up alternatives bound to a flavor, taken over the alternatives with devices on the
-flavor's nodes, which needs the per-node device knowledge of
-[DRA Device Feasibility](#dra-device-feasibility).
+Kueue assigns a PodSet one flavor per resource group, and its Pods carry that flavor's node labels.
+When each alternative's devices sit behind a different flavor, only the alternative on the assigned
+flavor can run, so the fallback happens between flavors rather than between devices. The charge is
+the same either way. A fallback within one flavor needs that flavor's nodes to carry both kinds of
+device, as in [Story 6](#story-6).
 
 ##### A reservation is not bound to the claim that gets created
 
-The bound is defined for a fixed `ResourceClaimTemplate` identity and quota-affecting
-claim spec, from the reservation until the generated `ResourceClaim` is created. Kueue
-does not bind a reservation to a template deleted and recreated under the same name in that
-interval, so the generated claim can differ from the spec that was charged
-([#13842](https://github.com/kubernetes-sigs/kueue/issues/13842)). The gap is inherited from the
-`Exactly` path; the gate stays Alpha and off by default while it is open, and the binding is
-re-evaluated before Beta.
-
-##### Feasibility is checked, but it does not pick the alternative
-
-With `KueueDRADeviceFeasibility` on, [DRA Device Feasibility](#dra-device-feasibility) evaluates a
-`firstAvailable` request the way kube-scheduler would, walking the alternatives in order on each
-candidate node, and a Workload no node can satisfy stays pending instead of holding its charge.
-Only the verdict is kept: the alternative that made a node feasible is discarded, kube-scheduler
-picks the node and the alternative at allocation time, and different Pods of one PodSet can land
-on different alternatives. Feasibility can therefore refuse a reservation but never change it,
-and the same holds for the admission-time check the scheduler-library work
-([#12422](https://github.com/kubernetes-sigs/kueue/issues/12422)) is to add. With equal counts
-that costs nothing; once counts may differ, the verdict alone will not size the charge, which is
-why the Beta adjustment reads the allocation rather than the check.
-
-##### Selector compilation scales with the alternatives
-
-The worst case for one request is eight alternatives with 32 selectors each, the API's limits,
-8 × 32 = 256 distinct expressions against 32 for an `Exactly` request,
-which is the size of the quota path's shared compile cache, so a request of that shape evicts
-every other entry. With `KueueDRADeviceFeasibility` on, the feasibility path compiles the
-selectors again into a small cache of its own and evaluates them on every candidate node, in
-addition to the per-node attempt counted under [DRA Device Feasibility](#cost). The cost is
-stated here rather than measured; Beta decides whether to bound it.
+A ResourceClaimTemplate deleted and recreated under the same name between the reservation and the
+claim creation can produce a claim that differs from the one charged
+([#13842](https://github.com/kubernetes-sigs/kueue/issues/13842)). This also holds for `exactly`
+requests today.
 
 ### Integration with Admission Fair Sharing
 
@@ -2535,14 +2205,6 @@ Based on reviewers feedback describe what additional tests need to be added prio
 implementing this enhancement to ensure the enhancements have also solid foundations.
 -->
 
-The `firstAvailable` charge is computed on the path the `Exactly` charge already takes. The
-shared DRA defects on that path, and the regression that closes each, are tracked with the
-implementation in [#14130](https://github.com/kubernetes-sigs/kueue/pull/14130); the
-`firstAvailable` implementation does not ship while any of these properties is unmet, and each
-repaired path is regressed with a `firstAvailable` charge on the resource, the shape with
-nothing in the Pod spec to fall back on. The direct dependencies are a backoff requeue keeping the
-preprocessed charge, a charge and the spec it came from moving together, one queueing point
-owning the charge, a rejection being recoverable, and the CEL compiler environment.
 
 #### Unit Tests
 
@@ -2634,10 +2296,9 @@ using mock ResourceClaimTemplates and DeviceClasses to simulate DRA workloads. K
 - DRA device feasibility: a Workload whose ResourceClaims no node can satisfy stays pending
   and reports `draNoFit` rather than a generic no-fit, one whose claims a single node can
   satisfy is assigned to that node, and a Workload without claims is assigned to any node
-- `firstAvailable` Alpha scope: a Workload admitted on the count its alternatives share, charged
-  once; one refused because its alternatives differ in count; each refused row of the support
-  matrix recorded as inadmissible and cleared by the event its row names; and an `Exactly`-only
-  Workload charged the same with the gate on and off
+- `firstAvailable`: a Workload charged the `count` its alternatives share once, and Workloads
+  rejected for alternatives whose `count` differs and for alternatives mapped to different
+  logical resources
 
 #### E2E Test
 
@@ -2648,13 +2309,9 @@ driver publishes `SharedCounters` yet
 tracks adding this). This follows the same pattern as upstream K8s integration tests in
 `test/integration/dra/`.
 
-For `firstAvailable`, the e2e test forces the fallback rather than allowing it: one
-preferred-class device and one fallback-class device on a node, and two Pods sharing a template
-that asks for one preferred device or else one fallback device. The first Pod takes the preferred
-device and the second has to take the fallback one. The allocation result records the selected
-alternative as `<request>/<subrequest>`, so the test asserts that each alternative was selected
-once, that the admitted charge is 1 per Pod and 2 in total, and that the realized total equals
-it.
+For `firstAvailable`, an e2e test added for Beta forces the fallback: two Pods ask for one device
+of a preferred DeviceClass or else one of a fallback DeviceClass, on a node with one device of
+each. It asserts that each alternative is allocated once and that the Workload is charged 2.
 
 ### Graduation Criteria
 
@@ -2721,35 +2378,13 @@ it.
 
 ##### KueueDRAIntegrationPrioritizedList (v0.20)
 
-- Quota for `firstAvailable` under source-less mappings (KEP-4816, GA in k8s 1.36): every
-  alternative resolved through `deviceClassMappings` to one logical resource and asking for the
-  same count, that count charged once, added to the existing `Exactly` charge
-- The Alpha support matrix enforced by one classifier shared with the MultiKueue admission check,
-  refusing the whole request when any alternative is unsupported or its count differs from the
-  others
-- The charged resource names carried with the charge through queue and requeue, so a non-DRA
-  contribution on those names is refused
-- Charges summed exactly and emitted as a whole-unit quantity like the `Exactly` count, saturated
-  by the request path like any other resource, and a negative operand refused at the merge
-- Each rejection re-evaluated by the event that clears it, and read failures retried
-- User documentation stating that the feature is experimental and for evaluation outside
-  production, and which request shapes are refused
-- Unit, integration and e2e tests, including the forced-fallback e2e
-
-Parent prerequisites, owned by `KueueDRAIntegration` and not designed here:
-
-- an unchanged preprocessing result survives a backoff or a requeue
-- a Workload revision that changes what is charged, once observed, invalidates the earlier result
-- a recomputation that fails leaves no schedulable entry built from the superseded result, and one
-  queueing point owns the result
-- a deterministic rejection is recoverable
-
-Of these, the last is met in part today: a Workload whose DRA resources resolve on a later reconcile
-is requeued with reason `DRAResourcesResolved`
-([#15888](https://github.com/kubernetes-sigs/kueue/pull/15888)), but nothing yet wakes a parked
-Workload when the repair happens outside it, which
-[#13969](https://github.com/kubernetes-sigs/kueue/issues/13969) still tracks. This gate waits on
-that wake-up.
+- quota for `firstAvailable` requests whose alternatives ask for the same `count` on one logical
+  resource under source-less mappings (KEP-4816, GA in k8s 1.36)
+- reject every other `firstAvailable` request as [What is rejected](#what-is-rejected) lists, with
+  a message naming the rejected field
+- requires `KueueDRAIntegration`; enabling it without that gate is rejected at startup
+- user documentation stating that the feature is experimental and not for production use
+- unit and integration tests
 
 #### Beta
 
@@ -2825,43 +2460,29 @@ that wake-up.
 ##### KueueDRAIntegrationPrioritizedList
 
 - feature gate enabled by default
-- alternatives with different counts supported. The equal-count Alpha keeps the charge equal to
-  what runs; once counts may differ, the reservation is made before the choice, and each item
-  below is what that extension has to clear before it ships:
-  - no over-accounting held past allocation: the reservation adjusted to the realized alternative
-    once the generated `ResourceClaim` is allocated, so quota, Fair Sharing, Admission Fair
-    Sharing and preemption see what runs rather than the largest alternative; the gate does not
-    graduate while a Workload can hold more devices than it consumes. The adjustment is Kueue's
-    to make: an allocator-side constraint
+- support alternatives whose `count` differs, and alternatives mapped to different logical
+  resources, such as an A100 or else a B300 budgeted apart. Before either is supported:
+  - no over-accounting: quota, borrowing, Fair Sharing, the Admission Fair Sharing entry penalty,
+    and preemption for both the preemptor and its victims see the alternative that runs, not the
+    largest. The allocator constraint proposed upstream
     ([kubernetes/kubernetes#141510](https://github.com/kubernetes/kubernetes/issues/141510),
-    [kubernetes/kubernetes#142339](https://github.com/kubernetes/kubernetes/pull/142339)) is
-    aimed at custom schedulers rather than at kube-scheduler, so it is not what keeps an
-    allocation within what was charged
-  - preemption sized to realized allocations: a victim frees what it uses, and a preemptor that
-    allocates less than it reserved releases the difference once the adjustment above runs
-  - Topology Aware Scheduling features that place Pods by count (`TASBalancedPlacement`,
-    `TASTopologySpreading`, `TASMultiLayerTopology`, `TASNodeFeasibilityForAllLevels`) either
-    count devices per alternative or refuse such Workloads
-  - decide whether to expose the reserved-versus-realized gap as a metric, which the adjustment
-    above makes actionable
-- quota and feasibility paths agree on the supported-versus-rejected predicate, with tests
-- alternatives bound to a ResourceFlavor: the charge on a flavor taken over the alternatives with
-  devices on its nodes, so a request can fall back between logical resources rather than being
-  confined to alternatives an administrator already mapped to one
-- E2E stability for the source-less case
-- re-evaluate binding the admission-time DRA charge to the claim spec actually instantiated,
-  including a same-name `ResourceClaimTemplate` deleted and recreated between the reservation and
-  claim creation
-- re-evaluate source-backed alternatives, charging each through its source path; alternatives
-  whose charges differ in the source's units fall under the extension above, and an alternative
-  that matches no device fails closed rather than dropping out, since a charge over whichever
-  alternatives match the ResourceSlices of the moment goes stale and undercharges
-- support non-DRA contributions on charged resources once the shared accounting invariants hold,
-  naming which combinations become supported rather than lifting the limit as a whole
-- support a source-backed `Exactly` request in the same Workload, once an unavailable source fails
-  closed rather than contributing zero
-- re-evaluate refusing the static request shapes at the Workload webhook, together with the
-  `Exactly` path
+    [kubernetes/kubernetes#142339](https://github.com/kubernetes/kubernetes/pull/142339)) targets
+    custom schedulers rather than kube-scheduler, so Kueue solves this itself: by charging each
+    flavor only for the alternatives its nodes can run, as the per-node device check can tell, by
+    adjusting the charge once the claims are allocated, or both
+  - TAS features that place Pods by count (`TASBalancedPlacement`, `TASTopologySpreading`,
+    `TASMultiLayerTopology`, `TASNodeFeasibilityForAllLevels`) count devices per alternative once
+    they count devices, or reject such Workloads
+  - a ProvisioningRequest provisions for the alternative Kueue charged
+- reject a `firstAvailable` request none of whose alternatives matches enough devices, as
+  `exactly` requests are rejected
+- support integration with MultiKueue
+- re-evaluate support for alternatives with a `counter` or `capacity` source
+- re-evaluate binding the charge to the claim that is created
+  ([#13842](https://github.com/kubernetes-sigs/kueue/issues/13842))
+- re-evaluate rejecting at the Workload webhook, together with `exactly` requests
+- e2e tests covering that kube-scheduler falls back to the next alternative and that the
+  Workload is charged the shared `count` either way
 
 #### GA
 
@@ -2873,15 +2494,6 @@ that wake-up.
 - re-evaluate support for AllocationMode All
 - re-evaluate closing the admission-scheduling timing gap via scheduler-library
   integration
-
-##### KueueDRAIntegrationPrioritizedList
-
-- the feature gate in stable, with a lock-to-default or removal plan
-- production adoption feedback
-- final decision on source-backed alternatives, reusing the existing source paths rather than a
-  separate implementation
-- final decision on post-allocation reconciliation
-- version-skew and MultiKueue behavior validated
 
 ##### KueueDRAIntegrationExtendedResource
 
@@ -2900,6 +2512,11 @@ that wake-up.
   ResourceSlice pools to flavors requires scheduler-library awareness of which
   node a workload will land on. Depends on scheduler-library integration
   ([#12422](https://github.com/kubernetes-sigs/kueue/issues/12422)).
+
+##### KueueDRAIntegrationPrioritizedList
+
+- the feature gate in stable
+- user adoption feedback confirms the charge matches what runs
 
 ## Implementation History
 
@@ -2978,57 +2595,25 @@ stay in step by construction rather than by sharing an allocator.
 
 ### Charging alternatives that differ in count
 
-Alpha refuses a request whose alternatives ask for different counts. The charges considered for
-it:
+Kueue rejects a request whose alternatives differ in `count`. The charges considered:
 
-- The maximum count among the alternatives, an upper bound on whichever one kube-scheduler
-  allocates, is the charge core `ResourceQuota` uses per DeviceClass and was the earlier design
-  of this section. It was set aside for Alpha because the bound is held for the life of the
-  Workload: a request whose first choice is one device and whose fallback is two reserves two,
-  does not fit a queue that can reach only one though the one-device choice would always have run
-  there, preempts for two, and is accounted two to its tenant under Fair Sharing, all while it may
-  run on one. It stays the likely Beta charge once the reservation is adjusted to the realized
-  alternative after allocation, which the [Beta criteria](#kueuedraintegrationprioritizedlist)
-  require.
-- Charging the first alternative was rejected: a request whose first choice is one device and
-  whose fallback is two would reserve one and could be allocated two.
-- Deferring the charge until allocation, or shrinking the reservation to the realized alternative
-  afterwards, was rejected for Alpha: quota is decided at admission, before any `ResourceClaim`
-  exists, and shrinking afterwards needs a mechanism that observes the generated claims and
-  updates admitted usage, cache, fair sharing, borrowing and preemption state.
-- Charging `All` its worst case, the largest allocation result core `ResourceQuota` assumes, was
-  rejected because Kueue's quota drives admission rather than capping a namespace: reserving 32
-  devices for a request that may take one would block admission and hold capacity nobody uses,
-  and the `Exactly` path refuses `All` today.
-
-### Admitting one variant Workload per alternative through ConcurrentAdmission
-
-Creating one variant Workload per alternative through ConcurrentAdmission
-([KEP-8691](../8691-concurrent-admission/README.md)), admitting whichever variant fits first and
-charging only that alternative, was considered and rejected. A variant there is the same PodSet
-spec scheduled against a subset of ResourceFlavors. A variant per alternative would need a claim
-carrying only its alternative, and nothing Kueue controls can produce one: `ResourceClaimTemplate`
-and `ResourceClaim` specs are immutable, and the set of Pod-level changes Kueue applies at
-admission carries no claim fields. Picking a variant therefore binds nothing.
-kube-scheduler still takes the first alternative that fits the node and cannot see the quota, so a
-request of two devices, or else one, admitted through the one-device variant into room for one,
-is charged one and allocated two. Binding the choice would mean Kueue writing the allocation
-itself, which makes Kueue the allocator; even then the choice would be made without the
-ResourceSlices kube-scheduler consults per node, and different Pods of one PodSet could no longer
-land on different alternatives. The variants also multiply, up to eight per request and the
-product across requests and claims, where KEP-8691 caps a ClusterQueue at sixteen flavors in one
-resource group. What the approach would buy, source-backed alternatives on day one through the
-existing counter and capacity pipelines, the Beta criterion pursues without variants, with an
-alternative that matches no device failing closed rather than dropping out.
-
-### Refusing a request whose mapped resource an excluded prefix covers
-
-Rejecting a `firstAvailable` request whose logical resource an `excludeResourcePrefixes` entry
-covers was considered and rejected: it gives the same `deviceClassMappings` entry different
-meanings for `Exactly` and `firstAvailable`, and the party told about it, the Workload's author, is
-not the one who can fix it. Refusing the configuration at startup is the other consistent answer,
-at the price of failing a startup over mappings this feature never touches; a follow-up issue
-should weigh it across every mapping rather than one request shape.
+- **The largest `count`**, which Kubernetes `ResourceQuota` uses. It never under-charges, but the
+  fallback costs quota for the Workload's life: "one device, else two" reserves two, preempts for
+  two and is accounted two under Fair Sharing while it may run on one. It stays a candidate once
+  the Beta over-accounting criterion is met.
+- **The first alternative's `count`**: rejected, since "one device, else two" reserves one and can
+  be allocated two.
+- **Deferring the charge, or shrinking it after allocation**: deferred to Beta. Quota is reserved
+  before any ResourceClaim exists, and shrinking needs a way to observe the claims and update
+  admitted usage.
+- **The worst case of `allocationMode: All`**, the 32 devices Kubernetes `ResourceQuota` assumes:
+  rejected, because reserving 32 devices for a request that may take one blocks admission for
+  capacity nobody uses.
+- **A ConcurrentAdmission variant per alternative**
+  ([KEP-8691](../8691-concurrent-admission/README.md)): rejected. A variant is the same Pod spec
+  against other flavors, and ResourceClaimTemplates are immutable, so Kueue cannot give a variant
+  a claim with one alternative. kube-scheduler can still pick any alternative, whichever variant
+  was charged.
 
 ### Webhook Rewriting Extended Resources to ResourceClaimTemplates
 
@@ -3291,35 +2876,25 @@ resource names in the ClusterQueue (e.g., `gpu.memory`) without an explicit mapp
 
 ### KEP-4816 Prioritized Alternatives in Device Requests
 
-[KEP-4816](https://github.com/kubernetes/enhancements/issues/4816) (`DRAPrioritizedList`: alpha in
-K8s 1.33, on by default in 1.34, GA in 1.36, locked on in 1.37) lets a `DeviceRequest` carry
-`firstAvailable`, an ordered list of up to eight alternatives, in place of `exactly`. Each
-alternative names a DeviceClass and asks for a `count` of devices under
-`allocationMode: ExactCount`, or for `All` matching devices; it may add `selectors`,
-`tolerations` and a `capacity` requirement, and it has no `adminAccess`. The API server defaults
-an omitted `allocationMode` to `ExactCount` and an omitted `count` to one. kube-scheduler tries
-the alternatives in order and allocates the first one the node it is placing on can satisfy,
-exactly one per request and without scoring, so the devices a claim gets need not be the best
-available in the cluster. The allocation result names the choice as `<request>/<subrequest>`.
+[KEP-4816](https://github.com/kubernetes/enhancements/issues/4816), gated by `DRAPrioritizedList`
+(alpha in Kubernetes 1.33, on by default in 1.34, GA in 1.36, locked on in 1.37), lets a device
+request carry `firstAvailable`, an ordered list of up to eight alternatives, in place of `exactly`.
+Each alternative names a DeviceClass and a `count`, and may add selectors, tolerations and a
+`capacity` requirement. kube-scheduler allocates exactly one alternative per request, the first
+that the node it is placing the Pod on can satisfy, and records the choice as
+`<request>/<subrequest>` in the claim's allocation results.
 
-KEP-4816 says of quota that the feature "will not serve as a quota management feature": core
-`ResourceQuota` counts every alternative, and nothing steers which one kube-scheduler picks.
-Whether an allocation can be steered by a quota policy is open upstream:
-[kubernetes/kubernetes#141510](https://github.com/kubernetes/kubernetes/issues/141510) asks for
-per-tenant device limits and
-[kubernetes/kubernetes#142339](https://github.com/kubernetes/kubernetes/pull/142339) proposes an
-allocator constraint for them, which its reviewers place with custom schedulers rather than with
-kube-scheduler.
+[KEP-4816](https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/4816-dra-prioritized-list/README.md#resource-quota)
+says the feature "will not serve as a quota management feature". Kubernetes `ResourceQuota` and
+Kueue charge it differently:
 
-Core `ResourceQuota`, also from KEP-4816, and Kueue count these requests differently:
-
-| | core `ResourceQuota` | Kueue |
+| Request | Kubernetes `ResourceQuota` | Kueue |
 |---|---|---|
-| Within one `firstAvailable` | maximum count among alternatives naming a given DeviceClass | the one count every alternative asks for, on their shared logical resource; a request whose alternatives differ in count is refused |
-| Across requests | adds each request's maximum count for each DeviceClass | adds each request's count to its logical resource |
-| Several DeviceClasses mapped to one logical resource | kept apart | collapsed into one charge |
-| Allocation mode `All` | finite worst case, the API's cap of 32 devices per allocation | refused for non-admin requests in this Alpha |
-| An allocation mode the build does not know | not counted | request refused |
+| One `firstAvailable` request | per DeviceClass, the largest `count` among its alternatives | the `count` all alternatives share; rejected if they differ |
+| Several requests | summed per DeviceClass | summed per logical resource |
+| Alternatives with different DeviceClasses | each DeviceClass charged | charged once if they map to one logical resource; rejected otherwise |
+| `allocationMode: All` | 32 devices, the API's limit | rejected |
+| Unknown `allocationMode` | not charged | rejected |
 
 ### KEP-5941 Shared Consumable Capacity
 
