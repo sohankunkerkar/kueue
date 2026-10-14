@@ -18,6 +18,7 @@
     - [Story 9](#story-9)
     - [Story 10](#story-10)
     - [Story 11](#story-11)
+    - [Story 12](#story-12)
   - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
     - [Integration support](#integration-support)
       - [Job](#job)
@@ -71,6 +72,13 @@
   - [Support for Elastic Workloads](#support-for-elastic-workloads)
   - [Balanced placement](#balanced-placement)
     - [Example](#example-3)
+  - [Required and preferred topology on one PodSet](#required-and-preferred-topology-on-one-podset)
+    - [Search with both levels](#search-with-both-levels)
+    - [Placement of a 16-Pod Job in three clusters](#placement-of-a-16-pod-job-in-three-clusters)
+    - [Preemption](#preemption)
+    - [Interaction with other features](#interaction-with-other-features)
+    - [Feature gate](#feature-gate)
+    - [Version skew with MultiKueue](#version-skew-with-multikueue)
   - [Support for topologies without a hostname level](#support-for-topologies-without-a-hostname-level)
   - [Support for Preferred Node Affinity](#support-for-preferred-node-affinity)
     - [Future Vision](#future-vision)
@@ -89,6 +97,8 @@
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
+  - [Preempt to reach the preferred level](#preempt-to-reach-the-preferred-level)
+  - [Keep rejecting required and preferred topology on one PodSet](#keep-rejecting-required-and-preferred-topology-on-one-podset)
   - [Account usage by watching DaemonSet pods](#account-usage-by-watching-daemonset-pods)
   - [Use label for workload](#use-label-for-workload)
   - [Implement it in ClusterAutoscaler or kube-scheduler](#implement-it-in-clusterautoscaler-or-kube-scheduler)
@@ -141,6 +151,8 @@ block.
 - allow a user to express that a workload prefers to schedule all of its pods
   within the same level of hierarchy, but automatically relax the constraint if
   not possible.
+- allow a user to set a required level and a lower preferred level on the same
+  PodSet
 - support Cluster Autoscaler via ProvisioningRequest
 
 ### Non-Goals
@@ -252,6 +264,31 @@ together across a multi-layer topology. For example, I want a LeaderWorkerSet
 with 16 pods (15 workers and 1 leader) to be placed onto the same "block", in
 slices of 4 on the same "rack" (3 racks of 4 workers, and 1 rack with 3 workers
 and 1 leader).
+
+#### Story 12
+
+As a user, I run a 16-Pod training Job.
+The Job must stay in one block, because traffic across the spine is too slow.
+The Job runs faster when all Pods share one rack, for example one NVLink domain.
+When no rack has room, I want the Job to start in one block, and not wait for a rack.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    kueue.x-k8s.io/queue-name: user-queue
+spec:
+  parallelism: 16
+  completions: 16
+  template:
+    metadata:
+      annotations:
+        kueue.x-k8s.io/podset-required-topology: cloud.provider.com/topology-block
+        kueue.x-k8s.io/podset-preferred-topology: cloud.provider.com/topology-rack
+```
+
+See [Required and preferred topology on one PodSet](#required-and-preferred-topology-on-one-podset).
 
 ### Notes/Constraints/Caveats (Optional)
 
@@ -886,6 +923,9 @@ const (
   // then the next topology level up is considered. If the PodSet cannot fit
   // at the highest topology level, then it gets admitted as distributed
   // among multiple topology domains.
+  //
+  // When PodSetRequiredTopologyAnnotation is also set, the value must be a
+  // level below it, and the search stops at the required level.
   PodSetPreferredTopologyAnnotation = "kueue.x-k8s.io/podset-preferred-topology"
 
   // PodSetUnconstrainedTopologyAnnotation indicates that a PodSet does not have any topology requirements.
@@ -939,7 +979,15 @@ the rules is deactivated):
   Job spec.
 - the annotations `kueue.x-k8s.io/podset-required-topology`,
   `kueue.x-k8s.io/podset-preferred-topology`, and `kueue.x-k8s.io/podset-unconstrained-topology`
-  are mutually exclusive.
+  are mutually exclusive, except that `kueue.x-k8s.io/podset-required-topology`
+  and `kueue.x-k8s.io/podset-preferred-topology` can be set together when the
+  `TASRequiredAndPreferredTopology` feature gate is enabled.
+- when both `kueue.x-k8s.io/podset-required-topology` and
+  `kueue.x-k8s.io/podset-preferred-topology` are set, the preferred level has to
+  be strictly below the required level. The Kueue webhooks cannot check this,
+  because the order of levels comes from the Topology. Kueue checks it when it
+  computes the assignment. The Workload stays pending with the message
+  "preferred topology X is not below required topology Y".
 - the value of `kueue.x-k8s.io/podset-slice-required-topology` is one of the labels
   specified in the topology node labels
 - the value of `kueue.x-k8s.io/podset-slice-required-topology` has to represent
@@ -958,9 +1006,20 @@ the rules is deactivated):
   - each layer's size must be evenly divisible by the size of the layer immediately below it
   - the number of layers must be less than or equal to the number of levels in the topology
   - topology labels must be unique within the constraints list
+- when both `kueue.x-k8s.io/podset-required-topology` and
+  `kueue.x-k8s.io/podset-preferred-topology` are set, the slice topology and
+  each multi-layer constraint level have to be at or below the preferred level.
+  Kueue checks this when it computes the assignment.
+- when both `kueue.x-k8s.io/podset-required-topology` and
+  `kueue.x-k8s.io/podset-preferred-topology` are set, the PodTemplate must not
+  set `kueue.x-k8s.io/podset-topology-spreading`. The Workload webhook applies
+  the same rule when a Workload sets both `required` and `preferred` in its
+  topology request.
 - if `kueue.x-k8s.io/podset-group-name` is specified, the `kueue.x-k8s.io/podset-required-topology`
   or `kueue.x-k8s.io/podset-preferred-topology` has to also be specified in all other
   PodTemplates included in the PodSet Group and it has to have the same value.
+  When a PodTemplate in the group sets both, every PodTemplate in the group has
+  to set both, with the same values.
 
 #### PodSet Slice size validation
 
@@ -1066,6 +1125,8 @@ type PodSetTopologyRequest struct {
   // preferred indicates the topology level preferred by the PodSet, as
   // indicated by the `kueue.x-k8s.io/podset-preferred-topology` PodSet
   // annotation.
+  // When required is also set, preferred must be a level below required.
+  // Kueue then starts the search at preferred and stops it at required.
   //
   // +optional
   Preferred *string `json:"preferred,omitempty"`
@@ -1712,6 +1773,9 @@ For a given PodSet Kueue:
   at which the PodSet fully fits within a topology domain corresponding to the
   level. Kueue starts the search from the specified level, but if the PodSet
   does not fit, then it tries higher levels in the hierarchy.
+- when both are used, Kueue starts the search at the preferred level, and does
+  not go above the required level. See
+  [Required and preferred topology on one PodSet](#required-and-preferred-topology-on-one-podset).
 
 Kueue places pods on domains with different algorithms, depending on the annotation and chosen profile:
 - `LeastFreeCapacity` algorithm - Kueue selects as many domains as needed (if it meets user's requirement) starting from the one with the least free capacity;
@@ -1991,6 +2055,124 @@ For a 3-level topology (block, rack, hostname), in the TopologyRequest, the user
 | [[15],[15]] [[15, 15]] | 25 | 1 | [[0],[0]] [[13, 12]] | prefer block where the request fits in a single rack
 | [[15], [15], [15, 15]] | 25|5 |  [[0], [0], [15, 10]] | `podset-slice-required-topology = hostname`
 
+### Required and preferred topology on one PodSet
+
+A PodSet can set both a required level and a lower preferred level, as in
+[Story 12](#story-12).
+Currently, Kueue rejects the pair in the PodTemplate annotations of every Job
+integration.
+On a Workload that a user creates directly, Kueue accepts the pair, but uses
+only the required level.
+
+All Job integrations read and check the annotations with the shared Job
+framework code.
+Thus, the change applies to all integrations, with no change in each one.
+
+#### Search with both levels
+
+When a PodSet sets both levels, Kueue does these steps:
+
+1. Kueue starts the search at the preferred level, as for
+   `podset-preferred-topology`.
+2. If a domain at the current level fits the PodSet, Kueue places the PodSet in
+   that domain.
+3. If no domain fits, Kueue tries the next level up.
+4. Kueue does not go above the required level. At the required level, Kueue
+   acts as for `podset-required-topology`. If no domain fits, the Workload
+   waits in the queue.
+
+When a PodSet sets only one level, Kueue keeps the current behavior.
+Users choose the trade-off with the annotations:
+
+| Annotations | Behavior |
+|---|---|
+| `required` only | Kueue picks the required-level domain with the least free capacity that fits. This keeps larger free domains for larger Workloads. |
+| `preferred` only | Kueue prefers locality with no upper limit. The PodSet can span domains at the highest level. |
+| both | Kueue prefers a preferred-level domain in any required-level domain. The PodSet never spans two required-level domains. |
+| `required` at the lower level | The PodSet waits until one lower-level domain fits. |
+
+#### Placement of a 16-Pod Job in three clusters
+
+The Topology has the levels block, rack and hostname.
+Each Pod uses one full node.
+Each cell gives the free nodes per rack.
+
+| Annotations | A: 10+9, B: 17+3 | A: 10+9, B: 8+3 | A: 10+5, B: 8+3 |
+|---|---|---|---|
+| `required: block` | A, racks 10+6 | A, racks 10+6 | waits |
+| `required: rack` | B, one rack | waits | waits |
+| `preferred: rack` | B, one rack | A, racks 10+6 | A and B |
+| `required: block`, `preferred: rack` | B, one rack | A, racks 10+6 | waits |
+
+In the first cluster, `required: block` picks block A, because A has the least
+free capacity that fits the Job.
+Block B stays whole for a later Workload.
+With both levels, the Job uses the rack in block B with 17 free nodes.
+
+#### Preemption
+
+Kueue adds no new preemption logic.
+To check if the PodSet fits after it removes candidates, preemption uses the
+same search as admission.
+Thus, preemption stops when the PodSet fits in one required-level domain.
+Kueue does not preempt Workloads only to place the PodSet in one
+preferred-level domain.
+This is the same as for `podset-preferred-topology` alone.
+A user who needs one rack sets `podset-required-topology` to the rack level.
+See [Preempt to reach the preferred level](#preempt-to-reach-the-preferred-level).
+
+All the placement steps use the one search:
+
+- the fit check at admission, and the check on an empty cluster
+- the fit check for each preemption candidate
+- the placement after preemption
+- the capacity reservation when Kueue finds no preemption candidates
+- the replacement of a failed node
+
+Thus, these steps agree about where the PodSet fits.
+
+#### Interaction with other features
+
+| Feature | With both levels |
+|---|---|
+| Slice topology, `TASMultiLayerTopology` | Each slice level must be at or below the preferred level. See [Validation](#validation). |
+| PodSet groups | Each PodSet in the group sets the same two levels. |
+| Failed node replacement | Kueue looks for a replacement node in the current required-level domain, as for `required` alone. It does not prefer the current preferred-level domain. |
+| `TASTopologySpreading` ([KEP-13746](../13746-tas-topology-spreading/README.md)) | Not supported in Alpha. Validation rejects the spreading annotation. |
+| `TASBalancedPlacement` | Not supported in Alpha. Kueue uses the search above. |
+| `ElasticJobsViaWorkloadSlicesWithTAS` | No change. Kueue rejects elastic Workloads with a required or a preferred level. |
+| ProvisioningRequest | No change. The second pass uses the same search. [Provisioning request and required mode](#provisioning-request-and-required-mode) applies. |
+| Topology ungater | No change. It uses the computed assignment. |
+
+#### Feature gate
+
+The `TASRequiredAndPreferredTopology` feature gate controls the pair.
+With the feature gate disabled, Kueue keeps the current behavior.
+It rejects the pair in the PodTemplate annotations.
+It uses only the required level of a Workload that sets both, and skips the
+order check.
+
+When an admin enables the feature gate, a Workload with the preferred level at
+or above the required level is not admitted.
+It stays pending with the message from [Validation](#validation).
+A Workload that sets both levels and spreading before the admin enables the
+feature gate stays accepted. The webhook checks the rule again only when an
+update changes the topology request or the spreading annotation.
+When an admin changes the feature gate, admitted Workloads keep their
+assignment.
+
+#### Version skew with MultiKueue
+
+The worker cluster computes the placement.
+The Workload webhook on the worker accepts both levels.
+A worker with an older Kueue, or with the feature gate disabled, uses only the
+required level.
+The Job then runs as for `podset-required-topology` alone, and the user sees
+no error.
+This is a known limitation in Alpha.
+To prevent it, admins enable the feature gate on the worker clusters before the
+manager cluster.
+
 ### Support for topologies without a hostname level
 
 Before 0.20, Kueue evaluated capacity and feasibility at the lowest level a Topology
@@ -2151,6 +2333,19 @@ We add integration tests for the following scenarios:
 - the PodSet assignment is computed successfully for `podset-preferred-topology`
   across multiple values
 - the PodSet assignment cannot be computed for `podset-preferred-topology`
+- the PodSet assignment with both `podset-required-topology` and
+  `podset-preferred-topology`, for each row and cluster in
+  [Placement of a 16-Pod Job in three clusters](#placement-of-a-16-pod-job-in-three-clusters)
+- preemption with both levels: no preemption when a required-level domain fits,
+  the minimal set of victims to fit in one required-level domain, and the
+  contrast with `podset-required-topology` at the rack level
+- with both levels, the Workload stays pending when the preferred level is not
+  below the required level, or when a slice level is above the preferred level
+- a PodSet group with both levels on each PodSet
+- validation of the pair in the PodTemplate annotations, with the
+  `TASRequiredAndPreferredTopology` feature gate enabled and disabled
+- with the feature gate disabled, Kueue places a Workload with both levels as
+  for `podset-required-topology` alone
 - the schedulingGate is added to the pod template
 
 #### Integration tests
@@ -2159,6 +2354,8 @@ We are going to add the integration tests to make sure the implementation is
 well covered. In particular, the following scenarios need coverage:
 - adding new nodes
 - PodSet assignment for `podset-preferred-topology` and `podset-required-topology`
+- the webhooks accept both annotations on one PodTemplate only when the
+  `TASRequiredAndPreferredTopology` feature gate is enabled
 - Job's pod template has the "topology" scheduling gate injected
 - un-gate pods by with the "topology" scheduling gate
 - the Workload can be suspended and unsuspended
@@ -2208,6 +2405,15 @@ The new validations which are for MVP, but likely will be relaxed in the future:
   eviction-vs-incremental tradeoff is exposed as a per-ClusterQueue/per-Workload policy (see the
   open questions in [Node failures](#node-failures) and
   [#6514](https://github.com/kubernetes-sigs/kueue/issues/6514)).
+- graduate `TASRequiredAndPreferredTopology` (Alpha in v0.21):
+  - decide on support of the pair with `TASTopologySpreading`,
+    `TASBalancedPlacement` and `ElasticJobsViaWorkloadSlicesWithTAS`
+  - decide, with user feedback, whether failed node replacement prefers the
+    current preferred-level domain
+  - decide, with user feedback, whether Kueue preempts to reach the preferred
+    level (see [Preempt to reach the preferred level](#preempt-to-reach-the-preferred-level))
+  - decide how to treat Workloads whose preferred level is not below the
+    required level, before Kueue enables the feature gate by default
 
 #### Stable
 
@@ -2232,6 +2438,7 @@ Consider the following improvements and implement if feasible:
 
 - 2024-07-25 - PR merged [Allow mutating schedulingGates when the Jobset is suspended](Allow mutating schedulingGates when the Jobset is suspended)
 - 2024-07-30 - this KEP
+- 2026-10-13 - required and preferred topology on one PodSet
 
 
 ## Drawbacks
@@ -2240,6 +2447,26 @@ Tracking of nodes by Kueue will increase its code complexity and memory
 consumption.
 
 ## Alternatives
+
+### Preempt to reach the preferred level
+
+With both levels, preemption could continue until the PodSet fits in one
+preferred-level domain.
+This needs a separate search mode that only preemption uses.
+Then preemption and the placement after preemption follow different rules.
+The capacity reservation and the check on an empty cluster at admission need
+the mode too.
+Also, each preemption step runs the search two times.
+
+**Reasons for discarding/deferring**
+
+A user who needs one rack can set `podset-required-topology` to the rack level.
+We will decide for Beta based on the users' feedback.
+
+### Keep rejecting required and preferred topology on one PodSet
+
+Users then have to drop one of the two constraints, so the workload loses either
+the hard bound or the locality preference that the user asked for.
 
 ### Account usage by watching DaemonSet pods
 
