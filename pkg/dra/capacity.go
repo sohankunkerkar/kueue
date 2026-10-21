@@ -305,14 +305,13 @@ func roundToValidRange(base resource.Quantity, vr *resourcev1.CapacityRequestPol
 	// Align to Min + n*Step. Skip alignment when Min is nil since the
 	// formula Min + n*Step is undefined without a base.
 	if vr.Step != nil && vr.Min != nil {
-		stepVal := utilmath.SafeValue(*vr.Step)
-		if stepVal > 0 {
-			minVal := utilmath.SafeValue(*vr.Min)
-			offset := utilmath.SaturatingSub(val, minVal)
-			if offset%stepVal != 0 {
-				val = utilmath.SaturatingAdd(minVal, utilmath.SaturatingMul(utilmath.SaturatingAdd(offset/stepVal, 1), stepVal))
-			}
-		}
+		val = alignToStep(val, utilmath.SafeValue(*vr.Min), utilmath.SafeValue(*vr.Step))
+		// With DRAFractionalCapacityRange, the kube-scheduler aligns the exact
+		// request in milli units, which can land above the whole-unit result:
+		// Min=250m, Step=500m and a request of 1 consume 1.25. Charge the larger
+		// of the two, rounded up to whole units, so the charge never falls below
+		// what the device gives up.
+		val = max(val, alignToStepInWholeUnits(base, vr))
 	}
 
 	// Check Max.
@@ -324,4 +323,30 @@ func roundToValidRange(base resource.Quantity, vr *resourcev1.CapacityRequestPol
 	}
 
 	return *resource.NewQuantity(val, base.Format), nil
+}
+
+// alignToStepInWholeUnits aligns the request to Min + n*Step in milli units,
+// as the kube-scheduler does with DRAFractionalCapacityRange, and rounds the
+// result up to whole units. It requires both Min and Step.
+func alignToStepInWholeUnits(base resource.Quantity, vr *resourcev1.CapacityRequestPolicyRange) int64 {
+	minMilli := utilmath.SafeMilliValue(*vr.Min)
+	valMilli := alignToStep(max(utilmath.SafeMilliValue(base), minMilli), minMilli, utilmath.SafeMilliValue(*vr.Step))
+	whole := valMilli / 1000
+	if valMilli%1000 > 0 {
+		whole++
+	}
+	return whole
+}
+
+// alignToStep rounds val up to the next minVal + n*stepVal. It leaves val
+// unchanged when stepVal is not positive.
+func alignToStep(val, minVal, stepVal int64) int64 {
+	if stepVal <= 0 {
+		return val
+	}
+	offset := utilmath.SaturatingSub(val, minVal)
+	if offset%stepVal == 0 {
+		return val
+	}
+	return utilmath.SaturatingAdd(minVal, utilmath.SaturatingMul(utilmath.SaturatingAdd(offset/stepVal, 1), stepVal))
 }

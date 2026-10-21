@@ -453,6 +453,10 @@ Kueue rounds capacity requests according to the device's `RequestPolicy`:
 | `ValidRange` without `Step` | Rounds up to `Min` if below; errors if exceeds `Max` |
 | No policy | Uses request as-is |
 
+Kueue charges quota in whole units. If the rounded value is fractional, Kueue
+charges the next whole unit. For example, `Min: 250m`, `Step: 500m` and a request of `1` round to `1.25`,
+and Kueue charges `2`.
+
 If the rounded value exceeds `Max` or all valid values, the workload is
 marked inadmissible.
 

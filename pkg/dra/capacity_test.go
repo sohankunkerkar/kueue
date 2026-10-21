@@ -159,6 +159,46 @@ func TestRoundToValidRange(t *testing.T) {
 			step:  "20Gi",
 			want:  "30Gi",
 		},
+		{
+			name:  "fractional step rounds the milli result up to whole units",
+			value: "1",
+			min:   "250m",
+			max:   "4",
+			step:  "500m",
+			want:  "2",
+		},
+		{
+			name:  "fractional request on a fractional grid rounds up to whole units",
+			value: "300m",
+			min:   "250m",
+			max:   "4",
+			step:  "250m",
+			want:  "1",
+		},
+		{
+			name:  "fractional request below a fractional min charges one whole unit",
+			value: "100m",
+			min:   "250m",
+			max:   "4",
+			step:  "250m",
+			want:  "1",
+		},
+		{
+			name:  "fractional request on a whole-unit grid",
+			value: "1500m",
+			min:   "1",
+			max:   "8",
+			step:  "1",
+			want:  "2",
+		},
+		{
+			name:  "keeps the whole-unit result when it is the larger one",
+			value: "2100m",
+			min:   "0",
+			max:   "8",
+			step:  "1100m",
+			want:  "4",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,6 +265,21 @@ func TestComputeCapacityCharge(t *testing.T) {
 			count:           1,
 			explicitRequest: ptrQty("20Gi"),
 			wantCharge:      "20Gi",
+		},
+		{
+			name: "fractional ValidRange charges whole units per device",
+			matched: []resourcev1.Device{
+				makeDevice("gpu-0", "4", &resourcev1.CapacityRequestPolicy{
+					ValidRange: &resourcev1.CapacityRequestPolicyRange{
+						Min:  ptrQty("250m"),
+						Step: ptrQty("500m"),
+						Max:  ptrQty("4"),
+					},
+				}),
+			},
+			count:           2,
+			explicitRequest: ptrQty("1"),
+			wantCharge:      "4",
 		},
 		{
 			name: "no request uses device Default",
